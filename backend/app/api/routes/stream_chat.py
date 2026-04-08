@@ -18,7 +18,7 @@ router = APIRouter(prefix="/stream-chat", tags=["chat"])
 
 
 def sse_event(data: dict) -> str:
-    return f"data: {json.dumps(data, ensure_ascii=False)}\\n\\n"
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 @router.post("")
