@@ -18,7 +18,8 @@ router = APIRouter(prefix="/stream-chat", tags=["chat"])
 
 
 def sse_event(data: dict) -> str:
-    return f"data: {json.dumps(data, ensure_ascii=False)}\\n\\n"
+    # SSE requires real newline characters, not escaped ones
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 @router.post("")
@@ -26,11 +27,17 @@ async def stream_chat_endpoint(
     payload: ChatRequest,
     db: Session = Depends(get_db_session),
 ) -> StreamingResponse:
-    conversation = db.query(Conversation).filter(Conversation.id == payload.conversation_id).first()
+    conversation = db.query(Conversation).filter(
+        Conversation.id == payload.conversation_id
+    ).first()
+
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    orchestrator = ConversationOrchestrator(db=db, tool_registry=ToolRegistry())
+    orchestrator = ConversationOrchestrator(
+        db=db,
+        tool_registry=ToolRegistry(),
+    )
 
     async def event_stream() -> AsyncIterator[str]:
         result = await orchestrator.handle_turn(
@@ -49,7 +56,9 @@ async def stream_chat_endpoint(
         )
 
         if not result.ok:
-            yield sse_event({"type": "error", "error": result.error or "Unknown error"})
+            yield sse_event(
+                {"type": "error", "error": result.error or "Unknown error"}
+            )
             yield sse_event({"type": "done"})
             return
 
@@ -58,7 +67,9 @@ async def stream_chat_endpoint(
             yield sse_event({"type": "content", "content": text})
 
         if result.tool_result:
-            yield sse_event({"type": "tool_result", "tool_result": result.tool_result})
+            yield sse_event(
+                {"type": "tool_result", "tool_result": result.tool_result}
+            )
 
         yield sse_event({"type": "done"})
 
