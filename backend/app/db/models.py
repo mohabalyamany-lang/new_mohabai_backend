@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import uuid4
 
-from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     JSON,
     Boolean,
@@ -327,9 +326,7 @@ class Memory(Base):
     )
 
     content: Mapped[str] = mapped_column(Text)
-    embedding: Mapped[list[float] | None] = mapped_column(
-        Vector(1536), nullable=True
-    )
+    embedding: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     salience_score: Mapped[float] = mapped_column(Float, default=0.0)
     metadata_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
