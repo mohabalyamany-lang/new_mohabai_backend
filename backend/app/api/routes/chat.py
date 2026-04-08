@@ -1,31 +1,15 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.db.models import Conversation
 from app.db.session import get_db_session
+from app.schemas.chat import ChatRequest, ChatResponse
 from app.services.orchestrator import ConversationOrchestrator
 from app.tools.registry import ToolRegistry
 
 router = APIRouter(prefix="/chat", tags=["chat"])
-
-
-class ChatRequest(BaseModel):
-    conversation_id: int
-    message: str
-
-
-class ChatResponse(BaseModel):
-    ok: bool
-    conversation_id: int
-    turn_id: int | None
-    assistant_text: str | None
-    planner_action: dict
-    planner_trace: list[dict]
-    tool_result: dict | None = None
-    error: str | None = None
 
 
 @router.post("", response_model=ChatResponse)
