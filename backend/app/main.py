@@ -33,6 +33,7 @@ def create_app() -> FastAPI:
         }
 
     app.include_router(chat_router, prefix=settings.api_v1_prefix)
+
     return app
 
 
