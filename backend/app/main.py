@@ -2,9 +2,11 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.api.routes.auth import router as auth_router
 from app.api.routes.chat import router as chat_router
 from app.api.routes.conversations import router as conversations_router
 from app.api.routes.stream_chat import router as stream_chat_router
+from app.api.routes.uploads import router as uploads_router
 from app.config import get_settings
 from app.core.logging import configure_logging
 from app.core.telemetry import configure_telemetry
@@ -34,9 +36,11 @@ def create_app() -> FastAPI:
             "environment": settings.app_env,
         }
 
+    app.include_router(auth_router, prefix=settings.api_v1_prefix)
     app.include_router(conversations_router, prefix=settings.api_v1_prefix)
     app.include_router(chat_router, prefix=settings.api_v1_prefix)
     app.include_router(stream_chat_router, prefix=settings.api_v1_prefix)
+    app.include_router(uploads_router, prefix=settings.api_v1_prefix)
     return app
 
 
