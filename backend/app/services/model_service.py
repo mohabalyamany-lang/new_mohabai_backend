@@ -1,0 +1,314 @@
+from __future__ import annotations
+
+import json
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from typing import Any
+
+import httpx
+
+from app.config import get_settings
+
+settings = get_settings()
+
+
+@dataclass(slots=True)
+class ModelChunk:
+    text: str
+
+
+@dataclass(slots=True)
+class ModelResponse:
+    content: str
+    raw: dict[str, Any]
+
+
+class BaseChatProvider:
+    name: str
+
+    async def complete(self, messages: list[dict[str, str]], max_tokens: int = 1200) -> ModelResponse:
+        raise NotImplementedError
+
+    async def stream(self, messages: list[dict[str, str]], max_tokens: int = 1200) -> AsyncIterator[ModelChunk]:
+        raise NotImplementedError
+
+
+class OpenAIChatProvider(BaseChatProvider):
+    name = "openai"
+
+    def __init__(self, model: str = "gpt-4.1-mini") -> None:
+        self.model = model
+        self.url = "https://api.openai.com/v1/chat/completions"
+
+    async def complete(self, messages: list[dict[str, str]], max_tokens: int = 1200) -> ModelResponse:
+        if not settings.openai_api_key:
+            raise RuntimeError("OPENAI_API_KEY is not configured")
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.7,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=6.0)) as client:
+            response = await client.post(
+                self.url,
+                headers={
+                    "Authorization": f"Bearer {settings.openai_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        content = data["choices"][0]["message"]["content"]
+        return ModelResponse(content=content, raw=data)
+
+    async def stream(self, messages: list[dict[str, str]], max_tokens: int = 1200) -> AsyncIterator[ModelChunk]:
+        if not settings.openai_api_key:
+            raise RuntimeError("OPENAI_API_KEY is not configured")
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.7,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=6.0)) as client:
+            async with client.stream(
+                "POST",
+                self.url,
+                headers={
+                    "Authorization": f"Bearer {settings.openai_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+
+                async for line in response.aiter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+
+                    data_str = line[6:].strip()
+                    if data_str == "[DONE]":
+                        break
+
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    delta = (
+                        data.get("choices", [{}])[0]
+                        .get("delta", {})
+                        .get("content")
+                    )
+                    if delta:
+                        yield ModelChunk(text=delta)
+
+
+class GroqChatProvider(BaseChatProvider):
+    name = "groq"
+
+    def __init__(self, model: str = "llama-3.3-70b-versatile") -> None:
+        self.model = model
+        self.url = "https://api.groq.com/openai/v1/chat/completions"
+
+    async def complete(self, messages: list[dict[str, str]], max_tokens: int = 1200) -> ModelResponse:
+        if not settings.groq_api_key:
+            raise RuntimeError("GROQ_API_KEY is not configured")
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.6,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=6.0)) as client:
+            response = await client.post(
+                self.url,
+                headers={
+                    "Authorization": f"Bearer {settings.groq_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        content = data["choices"][0]["message"]["content"]
+        return ModelResponse(content=content, raw=data)
+
+    async def stream(self, messages: list[dict[str, str]], max_tokens: int = 1200) -> AsyncIterator[ModelChunk]:
+        if not settings.groq_api_key:
+            raise RuntimeError("GROQ_API_KEY is not configured")
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.6,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=6.0)) as client:
+            async with client.stream(
+                "POST",
+                self.url,
+                headers={
+                    "Authorization": f"Bearer {settings.groq_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+
+                async for line in response.aiter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+
+                    data_str = line[6:].strip()
+                    if data_str == "[DONE]":
+                        break
+
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    delta = (
+                        data.get("choices", [{}])[0]
+                        .get("delta", {})
+                        .get("content")
+                    )
+                    if delta:
+                        yield ModelChunk(text=delta)
+
+
+class OpenRouterChatProvider(BaseChatProvider):
+    name = "openrouter"
+
+    def __init__(self, model: str = "google/gemma-3-12b-it:free") -> None:
+        self.model = model
+        self.url = "https://openrouter.ai/api/v1/chat/completions"
+
+    async def complete(self, messages: list[dict[str, str]], max_tokens: int = 1200) -> ModelResponse:
+        if not settings.openrouter_api_key:
+            raise RuntimeError("OPENROUTER_API_KEY is not configured")
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.6,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=6.0)) as client:
+            response = await client.post(
+                self.url,
+                headers={
+                    "Authorization": f"Bearer {settings.openrouter_api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://mohabai.vercel.app",
+                    "X-Title": "Mohab AI",
+                },
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        content = data["choices"][0]["message"]["content"]
+        return ModelResponse(content=content, raw=data)
+
+    async def stream(self, messages: list[dict[str, str]], max_tokens: int = 1200) -> AsyncIterator[ModelChunk]:
+        if not settings.openrouter_api_key:
+            raise RuntimeError("OPENROUTER_API_KEY is not configured")
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.6,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=6.0)) as client:
+            async with client.stream(
+                "POST",
+                self.url,
+                headers={
+                    "Authorization": f"Bearer {settings.openrouter_api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://mohabai.vercel.app",
+                    "X-Title": "Mohab AI",
+                },
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+
+                async for line in response.aiter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+
+                    data_str = line[6:].strip()
+                    if data_str == "[DONE]":
+                        break
+
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    delta = (
+                        data.get("choices", [{}])[0]
+                        .get("delta", {})
+                        .get("content")
+                    )
+                    if delta:
+                        yield ModelChunk(text=delta)
+
+
+class ModelService:
+    def __init__(self) -> None:
+        self.providers: list[BaseChatProvider] = []
+
+        if settings.openai_api_key:
+            self.providers.append(OpenAIChatProvider())
+        if settings.groq_api_key:
+            self.providers.append(GroqChatProvider())
+        if settings.openrouter_api_key:
+            self.providers.append(OpenRouterChatProvider())
+
+        if not self.providers:
+            raise RuntimeError("No chat model providers are configured")
+
+    async def complete(self, messages: list[dict[str, str]], max_tokens: int = 1200) -> ModelResponse:
+        last_error: Exception | None = None
+        for provider in self.providers:
+            try:
+                return await provider.complete(messages=messages, max_tokens=max_tokens)
+            except Exception as exc:
+                last_error = exc
+                continue
+        raise RuntimeError(f"All model providers failed: {last_error}")
+
+    async def stream(self, messages: list[dict[str, str]], max_tokens: int = 1200) -> AsyncIterator[ModelChunk]:
+        last_error: Exception | None = None
+        for provider in self.providers:
+            try:
+                async for chunk in provider.stream(messages=messages, max_tokens=max_tokens):
+                    yield chunk
+                return
+            except Exception as exc:
+                last_error = exc
+                continue
+        raise RuntimeError(f"All model providers failed: {last_error}")
