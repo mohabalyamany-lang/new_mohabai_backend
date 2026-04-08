@@ -26,7 +26,10 @@ async def stream_chat_endpoint(
     payload: ChatRequest,
     db: Session = Depends(get_db_session),
 ) -> StreamingResponse:
-    conversation = db.query(Conversation).filter(Conversation.id == payload.conversation_id).first()
+    conversation = db.query(Conversation).filter(
+        Conversation.id == payload.conversation_id
+    ).first()
+
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
