@@ -10,6 +10,7 @@ from app.planner.task_manager import task_manager
 from app.planner.step_executor import step_executor
 from app.reflection.reflection_engine import reflection_engine
 from app.reflection.reliability_controller import reliability_controller
+from app.runtime.token_budget import TokenBudget
 from app.safety.safety_guards import SafetyGuards
 from app.services.llm_service import llm_service
 from app.tools.tool_wrapper import ToolWrapper
@@ -17,6 +18,7 @@ from app.tools.tool_wrapper import ToolWrapper
 MAX_STEPS = 6
 
 tool_wrapper = ToolWrapper()
+token_budget = TokenBudget()
 
 
 class AgentLoop:
@@ -34,6 +36,11 @@ class AgentLoop:
     ) -> str:
 
         guards = SafetyGuards()
+
+        # Cost control — check token budget before doing anything
+        tokens_used_today = 0  # TODO: load from DB per user later
+        if not token_budget.allow(tokens_used_today):
+            return "You have reached your daily usage limit."
 
         # Goal detection — start a task if this looks like a multi-step goal
         if db and user_id and user_message:
@@ -71,7 +78,6 @@ class AgentLoop:
                     tools=TOOLS,
                 )
             except Exception:
-                # Retry with smaller context on failure
                 try:
                     response = await llm_service.chat_with_tools(
                         messages=messages[-5:],
