@@ -4,6 +4,8 @@ import json
 
 from app.agent.tool_schema import TOOLS
 from app.agent.tool_registry import TOOL_REGISTRY
+from app.memory.context_compressor import context_compressor
+from app.observability.tracer import tracer
 from app.planner.task_manager import task_manager
 from app.planner.step_executor import step_executor
 from app.reflection.reflection_engine import reflection_engine
@@ -11,7 +13,6 @@ from app.reflection.reliability_controller import reliability_controller
 from app.safety.safety_guards import SafetyGuards
 from app.services.llm_service import llm_service
 from app.tools.tool_wrapper import ToolWrapper
-from app.memory.context_compressor import context_compressor
 
 MAX_STEPS = 6
 
@@ -59,33 +60,49 @@ class AgentLoop:
             if not guards.allow_reason():
                 return "I'm stopping here to avoid excessive reasoning loops."
 
+            # Compress context before sending to LLM
             messages = await context_compressor.compress(messages)
-            
-            response = await llm_service.chat_with_tools(
-                messages=messages,
-                tools=TOOLS,
-            )
+
+            # LLM call with failure recovery
+            span = tracer.start("reasoning")
+            try:
+                response = await llm_service.chat_with_tools(
+                    messages=messages,
+                    tools=TOOLS,
+                )
+            except Exception:
+                # Retry with smaller context on failure
+                try:
+                    response = await llm_service.chat_with_tools(
+                        messages=messages[-5:],
+                        tools=TOOLS,
+                    )
+                except Exception:
+                    return "I encountered an error and could not complete the task."
+            tracer.end(span, {"messages_count": len(messages)})
 
             # Final answer — no tool call needed
             if "tool_call" not in response:
                 reply = response["content"]
 
-                # Reflection + reliability layer
-                reflection = await reflection_engine.evaluate(
-                    user_message,
-                    reply,
-                )
+                # Reflection + reliability layer with failure bypass
+                try:
+                    reflection = await reflection_engine.evaluate(
+                        user_message,
+                        reply,
+                    )
+                    repair = await reliability_controller.stabilize(
+                        reflection,
+                        self,
+                        user_message,
+                        messages,
+                    )
+                    if repair:
+                        reply = repair
+                except Exception:
+                    pass  # Reflection failed — return original reply
 
-                repair = await reliability_controller.stabilize(
-                    reflection,
-                    self,
-                    user_message,
-                    messages,
-                )
-
-                if repair:
-                    reply = repair
-
+                tracer.end(tracer.start("reply"), {"reply_length": len(reply)})
                 return reply
 
             # Guard: check tool call budget
@@ -97,7 +114,11 @@ class AgentLoop:
             args = tool_call["arguments"]
 
             tool_fn = TOOL_REGISTRY[tool_name]
+
+            # Tool execution with tracing (retry handled by tool_wrapper)
+            span = tracer.start("tool_execution")
             result = await tool_wrapper.execute(tool_fn, **args)
+            tracer.end(span, {"tool": tool_name})
 
             # Append reasoning state for next loop iteration
             messages.append({
