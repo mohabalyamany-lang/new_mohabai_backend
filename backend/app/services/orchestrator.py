@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 
@@ -336,44 +337,22 @@ class ConversationOrchestrator:
         )
         turn.user_message_id = user_msg.id
 
-        recent_messages = self._load_recent_messages(conversation.id, limit=12)
-
-        # ---------------- CLARIFICATION CHECK (Phase 10) ----------------
-        planner_action_preview = {
-            "decision": "act",
-            "intent": "chat",
-        }
-        if clarification_engine.should_clarify(user_message, planner_action_preview):
-            clarification_text = (
-                "Could you clarify what you mean? "
-                "I want to make sure I help you correctly."
-            )
-            assistant_msg = self._save_message(
-                conversation_id=conversation.id,
-                turn_id=turn.id,
-                role=MessageRole.ASSISTANT,
-                content=clarification_text,
-            )
-            turn.assistant_message_id = assistant_msg.id
-            turn.status = TurnStatus.COMPLETED
-            self.db.commit()
-            return OrchestratorResult(
-                ok=True,
-                conversation_id=conversation.id,
-                turn_id=turn.id,
-                assistant_text=clarification_text,
-                planner_action={},
-                planner_trace=[],
-            )
-
-        # ---------------- PLANNER ----------------
-        planner_result = await self.planner_service.plan_turn(
-            user_message=user_message,
-            state=state,
-            recent_messages=[
-                {"role": msg.role.value, "content": msg.content or ""}
-                for msg in recent_messages
-            ],
+        # ---------------- PARALLEL MESSAGE LOAD & PLANNER ----------------
+        recent_messages, planner_result = await asyncio.gather(
+            asyncio.to_thread(
+                lambda: list(reversed(
+                    self.db.query(Message)
+                    .filter(Message.conversation_id == conversation.id)
+                    .order_by(Message.created_at.desc(), Message.id.desc())
+                    .limit(12)
+                    .all()
+                ))
+            ),
+            self.planner_service.plan_turn(
+                user_message=user_message,
+                state=state,
+                recent_messages=[],  # planner runs with empty history on first pass
+            ),
         )
 
         planner_action = planner_result.action.model_dump(mode="json")
