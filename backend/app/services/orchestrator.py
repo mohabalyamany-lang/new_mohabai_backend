@@ -7,7 +7,6 @@ from typing import Any
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.reflection.eval_logger import eval_logger
 from app.db.enums import ArtifactType, MessageRole, ToolName, ToolStatus, TurnStatus
 from app.db.models import Artifact, Conversation, Message, ToolEvent, Turn
 from app.interaction.clarification_engine import clarification_engine
@@ -19,13 +18,16 @@ from app.memory.memory_extractor import memory_extractor
 from app.memory.memory_retriever import memory_retriever
 from app.memory.memory_store import memory_store
 from app.planner.contracts import PlannerTool
+from app.planner.planning_prompts import PLANNER_PROMPT
 from app.planner.state_resolver import ResolvedConversationState
+from app.reflection.eval_logger import eval_logger
+from app.reflection.reliability_controller import reliability_controller
+from app.runtime.guards import input_guard, rate_limiter, tool_sandbox
 from app.services.context.context_builder import (
     INTERACTION_PROMPT,
     MEMORY_PROMPT_PREFIX,
     SYSTEM_PROMPT,
 )
-from app.planner.planning_prompts import PLANNER_PROMPT
 from app.services.model_service import ModelService
 from app.services.planner_service import PlannerService
 from app.tools.registry import ToolRegistry
@@ -216,7 +218,7 @@ class ConversationOrchestrator:
                         ),
                     })
             except Exception:
-                pass  # Memory retrieval failure should never block a response
+                pass
 
         # 3. Planner prompt — reasoning and tool decision instructions (Phase 11)
         messages.append({"role": "system", "content": PLANNER_PROMPT})
@@ -285,6 +287,34 @@ class ConversationOrchestrator:
         user_message: str,
         user_id: int | None = None,
     ) -> OrchestratorResult:
+
+        # ---------------- RATE LIMIT (Phase 13) ----------------
+        if user_id is not None:
+            if not rate_limiter.allow(user_id):
+                return OrchestratorResult(
+                    ok=False,
+                    conversation_id=conversation.id,
+                    turn_id=None,
+                    assistant_text="You're sending messages too quickly. Please wait a moment.",
+                    planner_action={},
+                    planner_trace=[],
+                    error="rate_limited",
+                )
+
+        # ---------------- INPUT VALIDATION (Phase 13) ----------------
+        clean_message = input_guard.sanitize(user_message)
+        is_valid, rejection_reason = input_guard.validate(clean_message)
+        if not is_valid:
+            return OrchestratorResult(
+                ok=False,
+                conversation_id=conversation.id,
+                turn_id=None,
+                assistant_text=rejection_reason,
+                planner_action={},
+                planner_trace=[],
+                error="input_rejected",
+            )
+        user_message = clean_message
 
         # ---------------- INTERACTION POLICY (Phase 10) ----------------
         policy = policy_resolver.resolve(user_message)
@@ -394,6 +424,24 @@ class ConversationOrchestrator:
             )
         else:
             tool = self.tool_registry.get(planner_result.action.tool.value)
+
+            # ---------------- TOOL SANDBOX (Phase 13) ----------------
+            tool_args = planner_result.action.tool_input.model_dump(exclude_none=True)
+            is_safe, sandbox_reason = tool_sandbox.validate_tool_call(
+                tool_name=planner_result.action.tool.value,
+                args=tool_args,
+            )
+            if not is_safe:
+                return OrchestratorResult(
+                    ok=False,
+                    conversation_id=conversation.id,
+                    turn_id=turn.id,
+                    assistant_text="I can't process that request.",
+                    planner_action=planner_action,
+                    planner_trace=planner_trace,
+                    error="tool_sandbox_rejected",
+                )
+
             tool_result = await tool.execute(
                 planner_action=planner_result.action,
                 conversation=conversation,
@@ -481,7 +529,8 @@ class ConversationOrchestrator:
                         memories=mems,
                     )
             except Exception:
-                pass  # Memory failure should never break a response
+                pass
+
         # ---------------- EVAL SCORING (Phase 12) ----------------
         if assistant_text:
             try:
@@ -497,8 +546,8 @@ class ConversationOrchestrator:
                     scores=scores,
                 )
             except Exception:
-                pass  # Scoring failure must never block a response
-        
+                pass
+
         return OrchestratorResult(
             ok=bool(tool_result.get("ok")),
             conversation_id=conversation.id,
