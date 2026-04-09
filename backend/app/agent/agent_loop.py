@@ -11,6 +11,7 @@ from app.reflection.reliability_controller import reliability_controller
 from app.safety.safety_guards import SafetyGuards
 from app.services.llm_service import llm_service
 from app.tools.tool_wrapper import ToolWrapper
+from app.memory.context_compressor import context_compressor
 
 MAX_STEPS = 6
 
