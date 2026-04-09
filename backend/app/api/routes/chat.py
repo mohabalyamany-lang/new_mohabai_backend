@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.db.models import Conversation, User
 from app.db.session import get_db_session
-from app.services.runtime_orchestrator import runtime_orchestrator
+from app.services.orchestrator import ConversationOrchestrator
+from app.tools.registry import ToolRegistry
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -18,7 +19,7 @@ async def chat(
     db: Session = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
-    convo = (
+    conversation = (
         db.query(Conversation)
         .filter(
             Conversation.id == conversation_id,
@@ -26,14 +27,29 @@ async def chat(
         )
         .first()
     )
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
 
-    result = await runtime_orchestrator.run_turn(
+    orchestrator = ConversationOrchestrator(
         db=db,
-        conversation_id=convo.id,
+        tool_registry=ToolRegistry(),
+    )
+
+    result = await orchestrator.handle_turn(
+        conversation=conversation,
         user_message=message,
+        user_id=user.id,
     )
 
     return {
-        "ok": True,
-        "result": result,
+        "ok": result.ok,
+        "conversation_id": result.conversation_id,
+        "turn_id": result.turn_id,
+        "result": {
+            "type": "chat",
+            "text": result.assistant_text,
+            "tool_result": result.tool_result,
+            "planner_action": result.planner_action,
+        },
+        "error": result.error,
     }
