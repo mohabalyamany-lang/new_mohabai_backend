@@ -1,55 +1,24 @@
-from __future__ import annotations
+from fastapi import APIRouter, Depends
+from app.runtime.runtime_controller import runtime_controller
+from app.db.session import get_db
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-
-from app.api.deps import get_current_user
-from app.db.models import Conversation, User
-from app.db.session import get_db_session
-from app.services.orchestrator import ConversationOrchestrator
-from app.tools.registry import ToolRegistry
-
-router = APIRouter(prefix="/chat", tags=["chat"])
+router = APIRouter()
 
 
-@router.post("")
+@router.post("/chat")
 async def chat(
-    message: str,
-    conversation_id: int,
-    db: Session = Depends(get_db_session),
-    user: User = Depends(get_current_user),
+    payload: dict,
+    db=Depends(get_db),
 ):
-    conversation = (
-        db.query(Conversation)
-        .filter(
-            Conversation.id == conversation_id,
-            Conversation.user_id == user.id,
-        )
-        .first()
-    )
-    if conversation is None:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+    user_id = payload["user_id"]
+    message = payload["message"]
+    state = payload.get("state", {})
 
-    orchestrator = ConversationOrchestrator(
+    reply = await runtime_controller.handle(
         db=db,
-        tool_registry=ToolRegistry(),
+        user_id=user_id,
+        message=message,
+        conversation_state=state,
     )
 
-    result = await orchestrator.handle_turn(
-        conversation=conversation,
-        user_message=message,
-        user_id=user.id,
-    )
-
-    return {
-        "ok": result.ok,
-        "conversation_id": result.conversation_id,
-        "turn_id": result.turn_id,
-        "result": {
-            "type": "chat",
-            "text": result.assistant_text,
-            "tool_result": result.tool_result,
-            "planner_action": result.planner_action,
-        },
-        "error": result.error,
-    }
+    return {"reply": reply}
