@@ -1,10 +1,12 @@
 from __future__ import annotations
+
 from sqlalchemy.orm import Session
+
+from app.agent.agent_loop import agent_loop
 from app.db.models import Message
 from app.services.artifact_service import ArtifactService
 from app.services.context.context_builder import context_builder
 from app.services.intent_engine import intent_engine
-from app.services.llm_service import llm_service
 from app.tools.tool_registry import tool_registry
 
 
@@ -68,7 +70,7 @@ class RuntimeOrchestrator:
             user_message=user_message,
         )
 
-        reply = await llm_service.chat(
+        reply = await agent_loop.run(
             [
                 {"role": m.role, "content": m.content}
                 for m in bundle.messages
