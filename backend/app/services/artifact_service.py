@@ -7,44 +7,49 @@ from app.db.models import Artifact
 
 
 class ArtifactService:
-    def __init__(self, db: Session) -> None:
-        self.db = db
 
-    def get_last_artifact(self, conversation_id: int) -> Artifact | None:
-        return (
-            self.db.query(Artifact)
-            .filter(Artifact.conversation_id == conversation_id)
-            .order_by(Artifact.created_at.desc(), Artifact.id.desc())
-            .first()
-        )
+    # ------------------------------------------------
+    # CREATE
+    # ------------------------------------------------
 
-    def create_artifact(
-        self,
+    @staticmethod
+    def create_image_artifact(
+        db: Session,
+        *,
         conversation_id: int,
-        turn_id: int,
-        artifact_type: ArtifactType,
-        title: str | None = None,
-        storage_url: str | None = None,
-        inline_data: str | None = None,
-        prompt: str | None = None,
-        effective_prompt: str | None = None,
-        metadata_json: dict | None = None,
-        source_tool_event_id: int | None = None,
+        turn_id: int | None,
+        prompt: str,
+        effective_prompt: str,
+        storage_url: str | None,
         parent_artifact_id: int | None = None,
     ) -> Artifact:
+
         artifact = Artifact(
             conversation_id=conversation_id,
             turn_id=turn_id,
-            source_tool_event_id=source_tool_event_id,
-            parent_artifact_id=parent_artifact_id,
-            artifact_type=artifact_type,
-            title=title,
-            storage_url=storage_url,
-            inline_data=inline_data,
+            artifact_type=ArtifactType.IMAGE,
             prompt=prompt,
             effective_prompt=effective_prompt,
-            metadata_json=metadata_json,
+            storage_url=storage_url,
+            parent_artifact_id=parent_artifact_id,
         )
-        self.db.add(artifact)
-        self.db.flush()
+
+        db.add(artifact)
+        db.flush()
         return artifact
+
+    # ------------------------------------------------
+    # RETRIEVE LAST IMAGE
+    # ------------------------------------------------
+
+    @staticmethod
+    def get_last_image(db: Session, conversation_id: int) -> Artifact | None:
+        return (
+            db.query(Artifact)
+            .filter(
+                Artifact.conversation_id == conversation_id,
+                Artifact.artifact_type == ArtifactType.IMAGE,
+            )
+            .order_by(Artifact.id.desc())
+            .first()
+        )
