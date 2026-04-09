@@ -433,32 +433,43 @@ class SemanticPlanner:
             )
 
         # Deterministic direct image generation
+        # Controlled image generation (NOT trigger-happy)
         if looks_like_image_request(user_message):
-            return PlannerResult(
-                action=PlannerAction(
-                    intent=PlannerIntent.IMAGE_GEN,
-                    tool=PlannerTool.IMAGE,
-                    decision=PlannerDecision.ACT,
-                    conversation_mode=ConversationMode.IMAGE_ITERATION,
-                    tool_input=ToolInput(image_instruction=user_message),
-                    state_patch=PlannerStatePatch(
-                        active_mode=ConversationMode.IMAGE_ITERATION,
-                        pending_intent="image_gen",
-                        pending_followup_kind="image",
-                        allow_context_carryover=True,
+            # HARD GUARD: prevent accidental triggering from normal conversation
+            if any([
+                is_social_feedback(user_message),
+                is_style_request(user_message),
+                is_general_chat_switch(user_message),
+            ]):
+                pass  # DO NOT route to image
+            else:
+                return PlannerResult(
+                    action=PlannerAction(
+                        intent=PlannerIntent.IMAGE_GEN,
+                        tool=PlannerTool.IMAGE,
+                        decision=PlannerDecision.ACT,
+                        conversation_mode=ConversationMode.IMAGE_ITERATION,
+                        tool_input=ToolInput(image_instruction=user_message),
+                        state_patch=PlannerStatePatch(
+                            active_mode=ConversationMode.IMAGE_ITERATION,
+                            pending_intent="image_gen",
+                            pending_followup_kind="image",
+                            allow_context_carryover=True,
+                        ),
+                        resolution=PlannerResolution(
+                            notes=["explicit_image_request_with_guard"]
+                        ),
+                        reason="validated_image_request",
+                        confidence=0.92,
                     ),
-                    resolution=PlannerResolution(notes=["direct_image_generation_request"]),
-                    reason="direct_image_request",
-                    confidence=0.95,
-                ),
-                trace=[
-                    PlannerTraceEntry(
-                        stage="deterministic",
-                        summary="Direct image request routed to image tool",
-                        details={"instruction": user_message},
-                    )
-                ],
-            )
+                    trace=[
+                        PlannerTraceEntry(
+                            stage="deterministic",
+                            summary="Validated image request",
+                            details={"instruction": user_message},
+                        )
+                    ],
+                )
 
         planner_context = PlannerContext(
             user_message=user_message,
