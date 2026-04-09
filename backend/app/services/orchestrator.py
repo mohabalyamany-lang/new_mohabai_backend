@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -8,8 +9,22 @@ from sqlalchemy.orm import Session
 
 from app.db.enums import ArtifactType, MessageRole, ToolName, ToolStatus, TurnStatus
 from app.db.models import Artifact, Conversation, Message, ToolEvent, Turn
+from app.interaction.clarification_engine import clarification_engine
+from app.interaction.interaction_overlay import InteractionOverlay
+from app.interaction.policy_resolver import policy_resolver
+from app.interaction.response_composer import response_composer
+from app.interaction.tone_adapter import tone_adapter
+from app.memory.memory_extractor import memory_extractor
+from app.memory.memory_retriever import memory_retriever
+from app.memory.memory_store import memory_store
 from app.planner.contracts import PlannerTool
 from app.planner.state_resolver import ResolvedConversationState
+from app.services.context.context_builder import (
+    INTERACTION_PROMPT,
+    MEMORY_PROMPT_PREFIX,
+    SYSTEM_PROMPT,
+)
+from app.planner.planning_prompts import PLANNER_PROMPT
 from app.services.model_service import ModelService
 from app.services.planner_service import PlannerService
 from app.tools.registry import ToolRegistry
@@ -75,7 +90,9 @@ class ConversationOrchestrator:
             last_user_message=last_user_message,
             last_assistant_message=last_assistant_message,
             has_files=False,
-            recent_turn_count=self.db.query(func.count(Turn.id)).filter(Turn.conversation_id == conversation.id).scalar() or 0,
+            recent_turn_count=self.db.query(func.count(Turn.id)).filter(
+                Turn.conversation_id == conversation.id
+            ).scalar() or 0,
         )
 
     def _create_turn(self, conversation_id: int) -> Turn:
@@ -139,7 +156,9 @@ class ConversationOrchestrator:
         self.db.flush()
         return event
 
-    def _apply_state_patch(self, conversation: Conversation, state_patch: dict[str, Any]) -> None:
+    def _apply_state_patch(
+        self, conversation: Conversation, state_patch: dict[str, Any]
+    ) -> None:
         if not state_patch:
             return
 
@@ -158,48 +177,72 @@ class ConversationOrchestrator:
         if "pending_followup_target" in state_patch:
             conversation.pending_followup_target = state_patch.get("pending_followup_target")
 
-        if "allow_context_carryover" in state_patch and state_patch.get("allow_context_carryover") is not None:
-            conversation.allow_context_carryover = bool(state_patch.get("allow_context_carryover"))
+        if (
+            "allow_context_carryover" in state_patch
+            and state_patch.get("allow_context_carryover") is not None
+        ):
+            conversation.allow_context_carryover = bool(
+                state_patch.get("allow_context_carryover")
+            )
 
-    def _build_chat_messages(
+    async def _build_chat_messages(
         self,
         conversation: Conversation,
         recent_messages: list[Message],
         user_message: str,
+        user_id: int | None = None,
         tool_result: dict[str, Any] | None = None,
     ) -> list[dict[str, str]]:
-        messages: list[dict[str, str]] = [
-            {
-                "role": "system",
-                "content": (
-                    "You are Mohab AI, a capable conversational assistant. "
-                    "Do not describe missing capabilities when tools were already used. "
-                    "Answer naturally, directly, and consistently with the conversation."
-                ),
-            }
-        ]
+        messages: list[dict[str, str]] = []
 
+        # 1. System prompt — global behavior rules (Phase 11)
+        messages.append({"role": "system", "content": SYSTEM_PROMPT})
+
+        # 2. Memory prompt — long-term user facts (Phase 11)
+        if user_id is not None:
+            try:
+                memories = await memory_retriever.retrieve(
+                    self.db,
+                    user_id=user_id,
+                    query=user_message,
+                )
+                if memories:
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            MEMORY_PROMPT_PREFIX
+                            + "\n".join(f"- {m}" for m in memories)
+                        ),
+                    })
+            except Exception:
+                pass  # Memory retrieval failure should never block a response
+
+        # 3. Planner prompt — reasoning and tool decision instructions (Phase 11)
+        messages.append({"role": "system", "content": PLANNER_PROMPT})
+
+        # 4. Interaction prompt — tone and style rules (Phase 11)
+        messages.append({"role": "system", "content": INTERACTION_PROMPT})
+
+        # 5. Conversation history
         for msg in recent_messages[-10:]:
             if msg.content:
-                messages.append(
-                    {
-                        "role": msg.role.value,
-                        "content": msg.content,
-                    }
-                )
+                messages.append({
+                    "role": msg.role.value,
+                    "content": msg.content,
+                })
 
+        # 6. Tool result injection if present
         if tool_result and tool_result.get("content"):
-            messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "A tool has produced the following result. "
-                        "Use it if relevant and answer naturally.\n\n"
-                        f"{tool_result['content']}"
-                    ),
-                }
-            )
+            messages.append({
+                "role": "system",
+                "content": (
+                    "A tool has produced the following result. "
+                    "Use it if relevant and answer naturally.\n\n"
+                    f"{tool_result['content']}"
+                ),
+            })
 
+        # 7. Current user message
         messages.append({"role": "user", "content": user_message})
         return messages
 
@@ -208,15 +251,20 @@ class ConversationOrchestrator:
         conversation: Conversation,
         user_message: str,
         recent_messages: list[Message],
+        user_id: int | None = None,
         tool_result: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        messages = self._build_chat_messages(
+        messages = await self._build_chat_messages(
             conversation=conversation,
             recent_messages=recent_messages,
             user_message=user_message,
+            user_id=user_id,
             tool_result=tool_result,
         )
-        response = await self.model_service.complete(messages=messages, max_tokens=1400)
+        response = await self.model_service.complete(
+            messages=messages,
+            max_tokens=1400,
+        )
         return {
             "ok": True,
             "tool": "chat",
@@ -230,7 +278,22 @@ class ConversationOrchestrator:
             "latency_ms": 0,
         }
 
-    async def handle_turn(self, conversation: Conversation, user_message: str) -> OrchestratorResult:
+    async def handle_turn(
+        self,
+        conversation: Conversation,
+        user_message: str,
+        user_id: int | None = None,
+    ) -> OrchestratorResult:
+
+        # ---------------- INTERACTION POLICY (Phase 10) ----------------
+        policy = policy_resolver.resolve(user_message)
+        overlay = InteractionOverlay(
+            style=policy.style,
+            user_prefers_brief=policy.style == "brief",
+            user_prefers_detail=policy.style == "detailed",
+            user_prefers_talkative=policy.style == "talkative",
+        )
+
         state = self._resolve_state(conversation)
         turn = self._create_turn(conversation.id)
 
@@ -243,6 +306,36 @@ class ConversationOrchestrator:
         turn.user_message_id = user_msg.id
 
         recent_messages = self._load_recent_messages(conversation.id, limit=12)
+
+        # ---------------- CLARIFICATION CHECK (Phase 10) ----------------
+        planner_action_preview = {
+            "decision": "act",
+            "intent": "chat",
+        }
+        if clarification_engine.should_clarify(user_message, planner_action_preview):
+            clarification_text = (
+                "Could you clarify what you mean? "
+                "I want to make sure I help you correctly."
+            )
+            assistant_msg = self._save_message(
+                conversation_id=conversation.id,
+                turn_id=turn.id,
+                role=MessageRole.ASSISTANT,
+                content=clarification_text,
+            )
+            turn.assistant_message_id = assistant_msg.id
+            turn.status = TurnStatus.COMPLETED
+            self.db.commit()
+            return OrchestratorResult(
+                ok=True,
+                conversation_id=conversation.id,
+                turn_id=turn.id,
+                assistant_text=clarification_text,
+                planner_action={},
+                planner_trace=[],
+            )
+
+        # ---------------- PLANNER ----------------
         planner_result = await self.planner_service.plan_turn(
             user_message=user_message,
             state=state,
@@ -253,11 +346,17 @@ class ConversationOrchestrator:
         )
 
         planner_action = planner_result.action.model_dump(mode="json")
-        planner_trace = [entry.model_dump(mode="json") for entry in planner_result.trace]
+        planner_trace = [
+            entry.model_dump(mode="json") for entry in planner_result.trace
+        ]
         turn.planner_trace = planner_trace
         turn.final_plan = planner_action
 
-        if planner_result.action.decision.value == "ask" and planner_result.action.reply_text:
+        # Planner decided to ask the user a question directly
+        if (
+            planner_result.action.decision.value == "ask"
+            and planner_result.action.reply_text
+        ):
             assistant_msg = self._save_message(
                 conversation_id=conversation.id,
                 turn_id=turn.id,
@@ -265,7 +364,10 @@ class ConversationOrchestrator:
                 content=planner_result.action.reply_text,
             )
             turn.assistant_message_id = assistant_msg.id
-            self._apply_state_patch(conversation, planner_result.action.state_patch.model_dump(mode="json"))
+            self._apply_state_patch(
+                conversation,
+                planner_result.action.state_patch.model_dump(mode="json"),
+            )
             turn.state_patch = planner_result.action.state_patch.model_dump(mode="json")
             turn.status = TurnStatus.COMPLETED
             self.db.commit()
@@ -279,6 +381,7 @@ class ConversationOrchestrator:
                 planner_trace=planner_trace,
             )
 
+        # ---------------- TOOL EXECUTION ----------------
         tool_result: dict[str, Any] | None = None
 
         if planner_result.action.tool == PlannerTool.CHAT:
@@ -286,6 +389,7 @@ class ConversationOrchestrator:
                 conversation=conversation,
                 user_message=user_message,
                 recent_messages=recent_messages,
+                user_id=user_id,
             )
         else:
             tool = self.tool_registry.get(planner_result.action.tool.value)
@@ -296,33 +400,43 @@ class ConversationOrchestrator:
                 db=self.db,
             )
 
-            if tool_result.get("ok") and planner_result.action.tool == PlannerTool.WEB:
+            if (
+                tool_result.get("ok")
+                and planner_result.action.tool == PlannerTool.WEB
+            ):
                 tool_result = await self._generate_chat_reply(
                     conversation=conversation,
                     user_message=user_message,
                     recent_messages=recent_messages,
+                    user_id=user_id,
                     tool_result=tool_result,
                 )
 
+        # ---------------- RESPONSE SHAPING (Phase 10) ----------------
+        assistant_text = tool_result.get("content") or ""
+        if assistant_text:
+            assistant_text = response_composer.compose(assistant_text, policy)
+            assistant_text = tone_adapter.mirror(user_message, assistant_text)
+            tool_result["content"] = assistant_text
+
+        # ---------------- SAVE TOOL EVENT ----------------
         tool_event = self._save_tool_event(
             conversation_id=conversation.id,
             turn_id=turn.id,
             tool_name=ToolName(planner_result.action.tool.value),
             status=ToolStatus.SUCCESS if tool_result.get("ok") else ToolStatus.FAILED,
             input_text=user_message,
-            output_text=tool_result.get("content"),
+            output_text=assistant_text,
             payload_json=tool_result,
             latency_ms=tool_result.get("latency_ms"),
         )
 
-        assistant_text = tool_result.get("content")
         assistant_json = tool_result.get("assistant_content_json")
-
         assistant_msg = self._save_message(
             conversation_id=conversation.id,
             turn_id=turn.id,
             role=MessageRole.ASSISTANT,
-            content=assistant_text,
+            content=assistant_text or None,
             content_json=assistant_json,
         )
         turn.assistant_message_id = assistant_msg.id
@@ -344,20 +458,35 @@ class ConversationOrchestrator:
                 )
             )
 
+        # ---------------- STATE PATCH ----------------
         merged_state_patch = planner_result.action.state_patch.model_dump(mode="json")
         merged_state_patch.update(tool_result.get("state_patch", {}))
         self._apply_state_patch(conversation, merged_state_patch)
-
         turn.state_patch = merged_state_patch
-        turn.status = TurnStatus.COMPLETED if tool_result.get("ok") else TurnStatus.FAILED
-
+        turn.status = (
+            TurnStatus.COMPLETED if tool_result.get("ok") else TurnStatus.FAILED
+        )
         self.db.commit()
+
+        # ---------------- MEMORY LEARNING ----------------
+        if user_id is not None:
+            try:
+                combined_text = f"User: {user_message}\nAssistant: {assistant_text}"
+                mems = await memory_extractor.extract(combined_text)
+                if mems:
+                    await memory_store.save_memories(
+                        self.db,
+                        user_id=user_id,
+                        memories=mems,
+                    )
+            except Exception:
+                pass  # Memory failure should never break a response
 
         return OrchestratorResult(
             ok=bool(tool_result.get("ok")),
             conversation_id=conversation.id,
             turn_id=turn.id,
-            assistant_text=assistant_text,
+            assistant_text=assistant_text or None,
             planner_action=planner_action,
             planner_trace=planner_trace,
             tool_result=tool_result,
