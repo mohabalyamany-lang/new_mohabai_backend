@@ -296,6 +296,39 @@ class SemanticPlanner:
                 ],
             )
 
+        # FIX 3 — HARD EXIT: user is clearly switching context to meta/identity questions
+        if any([
+            "who are you" in user_message.lower(),
+            "what are you" in user_message.lower(),
+            "how do you work" in user_message.lower(),
+        ]):
+            return PlannerResult(
+                action=PlannerAction(
+                    intent=PlannerIntent.CHAT,
+                    tool=PlannerTool.CHAT,
+                    decision=PlannerDecision.ACT,
+                    conversation_mode=ConversationMode.NORMAL_CHAT,
+                    state_patch=PlannerStatePatch(
+                        active_mode=ConversationMode.NORMAL_CHAT,
+                        clear_pending_target=True,
+                    ),
+                    resolution=PlannerResolution(
+                        topic_switch=True,
+                        clear_pending_target=True,
+                        notes=["explicit_identity_or_meta_question"],
+                    ),
+                    reason="user_switched_to_meta_chat",
+                    confidence=0.99,
+                ),
+                trace=[
+                    PlannerTraceEntry(
+                        stage="guard",
+                        summary="Forced exit to normal chat",
+                        details={"message": user_message},
+                    )
+                ],
+            )
+
         # Clean deterministic image cases
         if state.last_artifact_type == "image":
             if looks_like_image_question(user_message):
@@ -369,8 +402,12 @@ class SemanticPlanner:
                     ],
                 )
 
-        # Follow-up lookup against pending live target
-        if is_lookup_followup(user_message) and state.pending_followup_kind == "live_info" and state.pending_followup_target:
+        # FIX 4 — Follow-up lookup against pending live target (improved condition)
+        if (
+            state.pending_followup_kind == "live_info"
+            and state.pending_followup_target
+            and len(user_message.split()) <= 5
+        ):
             return PlannerResult(
                 action=PlannerAction(
                     intent=PlannerIntent.WEB_SEARCH,
@@ -432,7 +469,6 @@ class SemanticPlanner:
                 ],
             )
 
-        # Deterministic direct image generation
         # Controlled image generation (NOT trigger-happy)
         if looks_like_image_request(user_message):
             # HARD GUARD: prevent accidental triggering from normal conversation
