@@ -17,7 +17,7 @@ from app.interaction.tone_adapter import tone_adapter
 from app.memory.memory_extractor import memory_extractor
 from app.memory.memory_retriever import memory_retriever
 from app.memory.memory_store import memory_store
-from app.planner.contracts import PlannerTool
+from app.planner.contracts import PlannerIntent, PlannerTool
 from app.planner.planning_prompts import PLANNER_PROMPT
 from app.planner.state_resolver import ResolvedConversationState
 from app.reflection.eval_logger import eval_logger
@@ -375,6 +375,19 @@ class ConversationOrchestrator:
                 for msg in recent_messages
             ],
         )
+
+        # ---------------- FINAL INTENT SANITY CHECK (FIX 5) ----------------
+        msg = user_message.lower()
+        if planner_result.action.tool != PlannerTool.CHAT:
+            if any([
+                "who are you" in msg,
+                "what are you" in msg,
+                "be more" in msg,
+                "talkative" in msg,
+                "explain" in msg,
+            ]):
+                planner_result.action.tool = PlannerTool.CHAT
+                planner_result.action.intent = PlannerIntent.CHAT
 
         planner_action = planner_result.action.model_dump(mode="json")
         planner_trace = [
