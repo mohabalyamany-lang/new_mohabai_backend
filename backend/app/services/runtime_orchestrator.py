@@ -4,6 +4,11 @@ from sqlalchemy.orm import Session
 
 from app.agent.agent_loop import agent_loop
 from app.db.models import Message
+from app.interaction.clarification_engine import clarification_engine
+from app.interaction.interaction_overlay import InteractionOverlay
+from app.interaction.policy_resolver import policy_resolver
+from app.interaction.response_composer import response_composer
+from app.interaction.tone_adapter import tone_adapter
 from app.memory.memory_extractor import memory_extractor
 from app.memory.memory_store import memory_store
 from app.services.artifact_service import ArtifactService
@@ -21,11 +26,34 @@ class RuntimeOrchestrator:
         user_message: str,
         user_id: int | None = None,
     ) -> dict:
+
         last_image = ArtifactService.get_last_image(db, conversation_id)
+
+        # ---------------- INTENT ----------------
         intent = intent_engine.detect(
             user_message,
             has_last_image=last_image is not None,
         )
+
+        # ---------------- INTERACTION POLICY ----------------
+        policy = policy_resolver.resolve(user_message)
+        overlay = InteractionOverlay(
+            style=policy.style,
+            user_prefers_brief=policy.style == "brief",
+            user_prefers_detail=policy.style == "detailed",
+            user_prefers_talkative=policy.style == "talkative",
+        )
+
+        # ---------------- CLARIFICATION CHECK ----------------
+        planner_action = {
+            "decision": intent.intent,
+            "intent": intent.intent,
+        }
+        if clarification_engine.should_clarify(user_message, planner_action):
+            return {
+                "type": "clarification",
+                "text": "Could you clarify what you mean? I want to make sure I help you correctly.",
+            }
 
         # ---------------- IMAGE GENERATE ----------------
         if intent.intent == "image_generate":
@@ -78,9 +106,17 @@ class RuntimeOrchestrator:
             [
                 {"role": m.role, "content": m.content}
                 for m in bundle.messages
-            ]
+            ],
+            db=db,
+            user_id=user_id,
+            user_message=user_message,
         )
 
+        # ---------------- RESPONSE SHAPING ----------------
+        reply = response_composer.compose(reply, policy)
+        reply = tone_adapter.mirror(user_message, reply)
+
+        # ---------------- SAVE MESSAGES ----------------
         db.add(Message(
             conversation_id=conversation_id,
             role="user",
@@ -107,6 +143,9 @@ class RuntimeOrchestrator:
         return {
             "type": "chat",
             "text": reply,
+            "interaction": {
+                "style": overlay.style,
+            },
         }
 
 
