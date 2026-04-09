@@ -6,12 +6,12 @@ from app.agent.tool_schema import TOOLS
 from app.agent.tool_registry import TOOL_REGISTRY
 from app.memory.context_compressor import context_compressor
 from app.observability.tracer import tracer
+from app.observability.token_budget import TokenBudget
 from app.planner.task_manager import task_manager
 from app.planner.step_executor import step_executor
 from app.reflection.reflection_engine import reflection_engine
 from app.reflection.reliability_controller import reliability_controller
-from app.runtime.token_budget import TokenBudget
-from app.safety.safety_guards import SafetyGuards
+from app.runtime.guards import ExecutionGuards
 from app.services.llm_service import llm_service
 from app.tools.tool_wrapper import ToolWrapper
 
@@ -35,7 +35,7 @@ class AgentLoop:
         user_message: str = "",
     ) -> str:
 
-        guards = SafetyGuards()
+        guards = ExecutionGuards()
 
         # Cost control — check token budget before doing anything
         tokens_used_today = 0  # TODO: load from DB per user later
@@ -106,7 +106,7 @@ class AgentLoop:
                     if repair:
                         reply = repair
                 except Exception:
-                    pass  # Reflection failed — return original reply
+                    pass
 
                 tracer.end(tracer.start("reply"), {"reply_length": len(reply)})
                 return reply
@@ -126,7 +126,6 @@ class AgentLoop:
             result = await tool_wrapper.execute(tool_fn, **args)
             tracer.end(span, {"tool": tool_name})
 
-            # Append reasoning state for next loop iteration
             messages.append({
                 "role": "assistant",
                 "tool_call": tool_call,
