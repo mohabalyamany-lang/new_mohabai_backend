@@ -8,6 +8,7 @@ from app.planner.task_manager import task_manager
 from app.planner.step_executor import step_executor
 from app.reflection.reflection_engine import reflection_engine
 from app.reflection.reliability_controller import reliability_controller
+from app.safety.safety_guards import SafetyGuards
 from app.services.llm_service import llm_service
 
 MAX_STEPS = 6
@@ -26,6 +27,8 @@ class AgentLoop:
         user_id: int | None = None,
         user_message: str = "",
     ) -> str:
+
+        guards = SafetyGuards()
 
         # Goal detection — start a task if this looks like a multi-step goal
         if db and user_id and user_message:
@@ -47,6 +50,11 @@ class AgentLoop:
                     })
 
         for _ in range(MAX_STEPS):
+
+            # Guard: check reasoning iterations
+            if not guards.allow_reason():
+                return "I'm stopping here to avoid excessive reasoning loops."
+
             response = await llm_service.chat_with_tools(
                 messages=messages,
                 tools=TOOLS,
@@ -73,6 +81,10 @@ class AgentLoop:
                     reply = repair
 
                 return reply
+
+            # Guard: check tool call budget
+            if not guards.allow_tool():
+                raise RuntimeError("Tool limit reached")
 
             tool_call = response["tool_call"]
             tool_name = tool_call["name"]
