@@ -4,6 +4,8 @@ from sqlalchemy.orm import Session
 
 from app.agent.agent_loop import agent_loop
 from app.db.models import Message
+from app.memory.memory_extractor import memory_extractor
+from app.memory.memory_store import memory_store
 from app.services.artifact_service import ArtifactService
 from app.services.context.context_builder import context_builder
 from app.services.intent_engine import intent_engine
@@ -17,6 +19,7 @@ class RuntimeOrchestrator:
         db: Session,
         conversation_id: int,
         user_message: str,
+        user_id: int | None = None,
     ) -> dict:
         last_image = ArtifactService.get_last_image(db, conversation_id)
         intent = intent_engine.detect(
@@ -68,6 +71,7 @@ class RuntimeOrchestrator:
             db=db,
             conversation_id=conversation_id,
             user_message=user_message,
+            user_id=user_id,
         )
 
         reply = await agent_loop.run(
@@ -88,6 +92,17 @@ class RuntimeOrchestrator:
             content=reply,
         ))
         db.commit()
+
+        # ---------------- MEMORY LEARNING ----------------
+        if user_id is not None:
+            combined_text = f"User: {user_message}\nAssistant: {reply}"
+            mems = await memory_extractor.extract(combined_text)
+            if mems:
+                await memory_store.save_memories(
+                    db,
+                    user_id=user_id,
+                    memories=mems,
+                )
 
         return {
             "type": "chat",
