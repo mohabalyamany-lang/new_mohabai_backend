@@ -314,7 +314,7 @@ class SemanticPlanner:
                             pending_intent="image_question",
                             pending_followup_kind="image",
                             pending_followup_target=state.last_artifact_id,
-                            allow_context_carryover=True,
+                            allow_context_carryover=False,
                         ),
                         resolution=PlannerResolution(
                             uses_last_artifact=True,
@@ -351,7 +351,7 @@ class SemanticPlanner:
                             pending_intent="image_edit",
                             pending_followup_kind="image",
                             pending_followup_target=state.last_artifact_id,
-                            allow_context_carryover=True,
+                            allow_context_carryover=False,
                         ),
                         resolution=PlannerResolution(
                             uses_last_artifact=True,
@@ -383,7 +383,7 @@ class SemanticPlanner:
                         pending_intent="web_search",
                         pending_followup_kind="live_info",
                         pending_followup_target=state.pending_followup_target,
-                        allow_context_carryover=True,
+                        allow_context_carryover=False,
                     ),
                     resolution=PlannerResolution(
                         uses_pending_target=True,
@@ -415,7 +415,7 @@ class SemanticPlanner:
                         pending_intent="web_search",
                         pending_followup_kind="live_info",
                         pending_followup_target=user_message,
-                        allow_context_carryover=True,
+                        allow_context_carryover=False,
                     ),
                     resolution=PlannerResolution(
                         notes=["live_information_required"],
@@ -454,7 +454,7 @@ class SemanticPlanner:
                             active_mode=ConversationMode.IMAGE_ITERATION,
                             pending_intent="image_gen",
                             pending_followup_kind="image",
-                            allow_context_carryover=True,
+                            allow_context_carryover=False,
                         ),
                         resolution=PlannerResolution(
                             notes=["explicit_image_request_with_guard"]
