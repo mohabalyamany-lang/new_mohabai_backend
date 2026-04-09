@@ -481,7 +481,23 @@ class ConversationOrchestrator:
                     )
             except Exception:
                 pass  # Memory failure should never break a response
-
+        # ---------------- EVAL SCORING (Phase 12) ----------------
+        if assistant_text:
+            try:
+                scores = await reliability_controller.score(
+                    user_message=user_message,
+                    assistant_reply=assistant_text,
+                )
+                eval_logger.log(
+                    db=self.db,
+                    turn_id=turn.id,
+                    user_message=user_message,
+                    assistant_reply=assistant_text,
+                    scores=scores,
+                )
+            except Exception:
+                pass  # Scoring failure must never block a response
+        
         return OrchestratorResult(
             ok=bool(tool_result.get("ok")),
             conversation_id=conversation.id,
