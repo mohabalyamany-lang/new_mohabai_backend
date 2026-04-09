@@ -6,6 +6,8 @@ from app.agent.tool_schema import TOOLS
 from app.agent.tool_registry import TOOL_REGISTRY
 from app.planner.task_manager import task_manager
 from app.planner.step_executor import step_executor
+from app.reflection.reflection_engine import reflection_engine
+from app.reflection.reliability_controller import reliability_controller
 from app.services.llm_service import llm_service
 
 MAX_STEPS = 6
@@ -52,7 +54,25 @@ class AgentLoop:
 
             # Final answer — no tool call needed
             if "tool_call" not in response:
-                return response["content"]
+                reply = response["content"]
+
+                # Reflection + reliability layer
+                reflection = await reflection_engine.evaluate(
+                    user_message,
+                    reply,
+                )
+
+                repair = await reliability_controller.stabilize(
+                    reflection,
+                    self,
+                    user_message,
+                    messages,
+                )
+
+                if repair:
+                    reply = repair
+
+                return reply
 
             tool_call = response["tool_call"]
             tool_name = tool_call["name"]
