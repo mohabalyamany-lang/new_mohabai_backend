@@ -10,8 +10,11 @@ from app.reflection.reflection_engine import reflection_engine
 from app.reflection.reliability_controller import reliability_controller
 from app.safety.safety_guards import SafetyGuards
 from app.services.llm_service import llm_service
+from app.tools.tool_wrapper import ToolWrapper
 
 MAX_STEPS = 6
+
+tool_wrapper = ToolWrapper()
 
 
 class AgentLoop:
@@ -91,7 +94,7 @@ class AgentLoop:
             args = tool_call["arguments"]
 
             tool_fn = TOOL_REGISTRY[tool_name]
-            result = await tool_fn(**args)
+            result = await tool_wrapper.execute(tool_fn, **args)
 
             # Append reasoning state for next loop iteration
             messages.append({
