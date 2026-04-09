@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.reflection.eval_logger import eval_logger
 from app.db.enums import ArtifactType, MessageRole, ToolName, ToolStatus, TurnStatus
 from app.db.models import Artifact, Conversation, Message, ToolEvent, Turn
 from app.interaction.clarification_engine import clarification_engine
