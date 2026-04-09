@@ -58,6 +58,8 @@ class AgentLoop:
             if not guards.allow_reason():
                 return "I'm stopping here to avoid excessive reasoning loops."
 
+            messages = await context_compressor.compress(messages)
+            
             response = await llm_service.chat_with_tools(
                 messages=messages,
                 tools=TOOLS,
