@@ -2,6 +2,7 @@ from app.runtime.guard_pipeline import guard_pipeline
 from app.runtime.postprocessor import postprocessor
 from app.runtime.reflection_pipeline import reflection_pipeline
 from app.services.orchestrator import conversation_orchestrator
+from app.state.state_middleware import state_middleware
 
 
 class RuntimeController:
@@ -14,10 +15,13 @@ class RuntimeController:
         conversation_state,
     ):
         """
-        Standard non-streaming handler. 
-        Best for short messages or background processing.
+        Standard non-streaming handler with State Integration.
         """
-        # ---- Pre-guards ----
+        # ---- 1. Load Global State ----
+        # This retrieves long-term user preferences/data from the DB
+        global_state = await state_middleware.load(user_id)
+
+        # ---- 2. Pre-guards ----
         guard_result = await guard_pipeline.check(
             user_id=user_id,
             message=message,
@@ -26,21 +30,25 @@ class RuntimeController:
         if guard_result:
             return guard_result
 
-        # ---- Core execution ----
+        # ---- 3. Core execution ----
+        # We merge the current chat state with the global stored state
         reply = await conversation_orchestrator.handle(
             db=db,
             user_id=user_id,
             message=message,
-            conversation_state=conversation_state,
+            conversation_state={
+                **conversation_state,
+                **global_state,
+            },
         )
 
-        # ---- Reflection ----
+        # ---- 4. Reflection ----
         reply = await reflection_pipeline.run(
             user_message=message,
             reply=reply,
         )
 
-        # ---- Post processing ----
+        # ---- 5. Post processing ----
         await postprocessor.run(
             db=db,
             user_id=user_id,
@@ -58,10 +66,12 @@ class RuntimeController:
         conversation_state,
     ):
         """
-        High-performance streaming handler.
-        Allows the UI to display characters as they are generated.
+        Streaming handler with State Integration.
         """
-        # ---- Pre-guards ----
+        # ---- 1. Load Global State ----
+        global_state = await state_middleware.load(user_id)
+
+        # ---- 2. Pre-guards ----
         guard_result = await guard_pipeline.check(
             user_id=user_id,
             message=message,
@@ -71,22 +81,22 @@ class RuntimeController:
             yield guard_result
             return
 
-        # ---- Core execution (Streaming) ----
-        # We collect the full reply in a variable to run post-processing at the end
+        # ---- 3. Core execution (Streaming) ----
         full_reply_content = ""
 
         async for chunk in conversation_orchestrator.stream(
             db=db,
             user_id=user_id,
             message=message,
-            conversation_state=conversation_state,
+            conversation_state={
+                **conversation_state,
+                **global_state,
+            },
         ):
             full_reply_content += chunk
             yield chunk
 
-        # ---- Post processing (Background) ----
-        # Note: Reflection is usually skipped or handled differently in streaming 
-        # to prevent "rewriting" text the user has already seen.
+        # ---- 4. Post processing ----
         await postprocessor.run(
             db=db,
             user_id=user_id,
