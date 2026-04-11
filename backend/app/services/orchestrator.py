@@ -2,16 +2,23 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.planner.contracts import PlannerIntent, PlannerTool, ToolInput
+from app.planner.contracts import (
+    PlannerIntent,
+    PlannerTool,
+    ToolInput,
+)
 from app.planner.semantic_planner import semantic_planner
 from app.runtime.guards import tool_sandbox
 from app.services.context.context_builder import context_builder
+from app.services.execution_engine import ExecutionEngine
+from app.services.memory_service import MemoryService
 from app.services.model_service import ModelService
 from app.tools.registry import ToolRegistry
 
@@ -23,11 +30,16 @@ class OrchestratorResult:
     ok: bool
     reply: str
     conversation_id: int | None = None
-    turn_id: int | None = None
+    turn_id: str | None = None
     planner_action: dict[str, Any] = field(default_factory=dict)
     planner_trace: list[dict[str, Any]] = field(default_factory=list)
-    tool_results: dict[str, Any] = field(default_factory=dict)
+    tool_result: dict[str, Any] | None = None
     error: str | None = None
+
+    @property
+    def assistant_text(self) -> str | None:
+        """Alias for reply — used by stream_chat endpoint."""
+        return self.reply if self.ok else None
 
 
 class LastUserIntent(BaseModel):
@@ -92,8 +104,14 @@ def _extract_storage_url(result: dict[str, Any]) -> str | None:
 
 class ConversationOrchestrator:
 
-    def __init__(self) -> None:
-        self.tool_registry = ToolRegistry()
+    def __init__(
+        self,
+        db: Session | None = None,
+        tool_registry: ToolRegistry | None = None,
+    ) -> None:
+        self.db = db
+        self.tool_registry = tool_registry or ToolRegistry()
+        self.execution_engine = ExecutionEngine(self.tool_registry)
 
     async def _generate_chat_reply(
         self,
@@ -123,12 +141,24 @@ class ConversationOrchestrator:
 
     async def handle_turn(
         self,
-        db: Session,
-        user_id: int,
+        conversation: Any,
         user_message: str,
-        conversation_state: dict[str, Any],
+        user_id: int,
+        db: Session | None = None,
     ) -> OrchestratorResult:
+        """
+        Main entry point for handling a user turn.
+
+        Args:
+            conversation: SQLAlchemy Conversation model (must have .id)
+            user_message: Raw user message string
+            user_id: Authenticated user ID
+            db: Optional DB session override (uses self.db if not provided)
+        """
         from app.planner.state_resolver import ResolvedConversationState
+
+        effective_db = db or self.db
+        turn_id = uuid.uuid4().hex[:12]
 
         # ---- Follow-up query reconstruction ----
         last_intent = _intent_store.get(user_id)
@@ -143,8 +173,8 @@ class ConversationOrchestrator:
 
         # ---- Build context ----
         context_bundle = await context_builder.build(
-            db=db,
-            conversation_id=conversation_state.get("conversation_id"),
+            db=effective_db,
+            conversation_id=conversation.id,
             user_message=user_message,
             user_id=user_id,
         )
@@ -160,7 +190,8 @@ class ConversationOrchestrator:
             state=state,
         )
 
-        planner_action = planner_result.action.model_dump(mode="json")
+        action = planner_result.action
+        planner_action_dict = action.model_dump(mode="json")
         planner_trace = [e.model_dump(mode="json") for e in planner_result.trace]
 
         # Force web tool for follow-up of web intent
@@ -168,114 +199,130 @@ class ConversationOrchestrator:
             is_followup_question(user_message)
             and last_intent
             and last_intent.intent_type == "web"
-            and planner_result.action.tool == PlannerTool.CHAT
+            and action.tool == PlannerTool.CHAT
         ):
             previous_query = last_intent.entities.get("query", "")
             combined_query = f"{previous_query} {user_message}".strip()
-            planner_result.action.tool = PlannerTool.WEB
-            planner_result.action.intent = PlannerIntent.WEB_SEARCH
-            planner_result.action.tool_input = ToolInput(query=combined_query)
+            action = action.model_copy()
+            action.tool = PlannerTool.WEB
+            action.intent = PlannerIntent.WEB_SEARCH
+            action.tool_input = ToolInput(query=combined_query)
+            planner_action_dict = action.model_dump(mode="json")
 
-        action = planner_result.action
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # MEMORY WRITE — LLM suggests, system decides
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if action.intent.value == "memory_write":
+            memory_content = getattr(action.tool_input, "memory_content", None)
+            memory_operation = getattr(action.tool_input, "memory_operation", None)
+            confidence = action.confidence or 0.0
 
-        # ---- MULTI-STEP EXECUTION (Phase 10) ----
+            memory_service = MemoryService(effective_db)
+            memory = memory_service.add_memory_from_planner(
+                user_id=user_id,
+                memory_content=memory_content,
+                memory_operation=memory_operation,
+                confidence=confidence,
+            )
+
+            if memory:
+                reply = "Got it, I'll remember that."
+                planner_trace.append({
+                    "stage": "memory_stored",
+                    "summary": "Memory validated and stored",
+                    "details": {"memory_id": memory.id},
+                })
+            else:
+                # Memory rejected by validation — fall through to normal chat
+                planner_trace.append({
+                    "stage": "memory_rejected",
+                    "summary": "Memory validation rejected the write",
+                    "details": {"reason": "validation_failed"},
+                })
+                reply = await self._generate_chat_reply(
+                    msg_list=msg_list,
+                    user_message=user_message,
+                )
+
+            return OrchestratorResult(
+                ok=True,
+                reply=reply,
+                conversation_id=conversation.id,
+                turn_id=turn_id,
+                planner_action=planner_action_dict,
+                planner_trace=planner_trace,
+            )
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # MULTI-INTENT → Execution Engine
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         if planner_result.is_multi_intent and planner_result.steps:
-            execution_context: dict[str, Any] = {}
-
-            for step in sorted(planner_result.steps, key=lambda s: s.order):
-                step_tool = step.tool
-                step_input = step.tool_input or {}
-
+            # Validate all steps through sandbox before executing
+            for step in planner_result.steps:
                 is_safe, reason = tool_sandbox.validate_tool_call(
-                    tool_name=step_tool,
-                    args=step_input,
+                    tool_name=step.tool,
+                    args=step.tool_input or {},
                 )
                 if not is_safe:
                     return OrchestratorResult(
                         ok=False,
                         reply="I can't process that request.",
-                        planner_action=planner_action,
+                        conversation_id=conversation.id,
+                        turn_id=turn_id,
+                        planner_action=planner_action_dict,
                         planner_trace=planner_trace,
                         error=f"tool_sandbox_rejected: {reason}",
                     )
 
-                if step_tool == "chat":
-                    chat_reply = await model_service.chat(
-                        messages=msg_list + [
-                            {"role": "user", "content": step_input.get("query", user_message)}
-                        ]
-                    )
-                    execution_context[f"step_{step.order}"] = chat_reply
-                else:
-                    try:
-                        tool = self.tool_registry.get(step_tool)
-                        step_action = action.model_copy(update={
-                            "tool": PlannerTool(step_tool),
-                            "tool_input": ToolInput.model_validate(step_input),
-                        })
-                        step_result = await tool.execute(
-                            planner_action=step_action,
-                            conversation=None,
-                            turn=None,
-                            db=db,
-                        )
-                        storage_url = _extract_storage_url(step_result)
-                        if storage_url:
-                            execution_context[f"step_{step.order}"] = f"IMAGE_URL:{storage_url}"
-                        else:
-                            execution_context[f"step_{step.order}"] = step_result.get(
-                                "content", str(step_result)
-                            )
-                    except Exception as exc:
-                        execution_context[f"step_{step.order}"] = f"[error: {exc}]"
+            exec_result = await self.execution_engine.execute_plan(
+                planner_result=planner_result,
+                original_message=user_message,
+                conversation=conversation,
+                turn=None,
+                db=effective_db,
+            )
 
-            # Format execution context — surface image URLs directly
-            formatted_results = []
-            image_urls = []
-            for key, value in execution_context.items():
-                if isinstance(value, str) and value.startswith("IMAGE_URL:"):
-                    url = value[len("IMAGE_URL:"):]
-                    image_urls.append(url)
-                    formatted_results.append(f"{key}: [Image generated: {url}]")
-                else:
-                    formatted_results.append(f"{key}: {value}")
+            exec_trace = [e.model_dump(mode="json") for e in exec_result.trace]
+            combined_trace = planner_trace + exec_trace
 
-            if image_urls and len(execution_context) == 1:
+            # Check if execution completely failed
+            if exec_result.error and not exec_result.final_response:
                 return OrchestratorResult(
-                    ok=True,
-                    reply=f"Here is your image:\n{image_urls[0]}",
-                    planner_action=planner_action,
-                    planner_trace=planner_trace,
-                    tool_results=execution_context,
+                    ok=False,
+                    reply="Something went wrong processing your request.",
+                    conversation_id=conversation.id,
+                    turn_id=turn_id,
+                    planner_action=planner_action_dict,
+                    planner_trace=combined_trace,
+                    error=exec_result.error,
                 )
 
-            image_prefix = ""
-            if image_urls:
-                image_prefix = "Generated image(s):\n" + "\n".join(image_urls) + "\n\n"
+            # Build aggregated tool_result for frontend (images, citations, etc.)
+            aggregated_tool_result: dict[str, Any] = {
+                "ok": True,
+                "content": exec_result.final_response,
+                "artifacts": exec_result.final_artifacts,
+                "citations": exec_result.final_citations,
+                "multi_intent": True,
+                "step_count": len(planner_result.steps),
+                "steps_succeeded": sum(1 for s in exec_result.step_results if s.ok),
+            }
 
-            reasoning_prompt = (
-                "Use the following tool results to answer the user's question "
-                "naturally and completely. If there are image URLs, present them "
-                "to the user directly.\n\n"
-                + "\n".join(formatted_results)
-            )
-            final_msg_list = msg_list + [
-                {"role": "system", "content": reasoning_prompt},
-                {"role": "user", "content": user_message},
-            ]
-            reply = await model_service.chat(messages=final_msg_list)
-            if image_prefix:
-                reply = image_prefix + reply
+            reply = exec_result.final_response or "Done."
 
             return OrchestratorResult(
                 ok=True,
                 reply=reply,
-                planner_action=planner_action,
-                planner_trace=planner_trace,
-                tool_results=execution_context,
+                conversation_id=conversation.id,
+                turn_id=turn_id,
+                planner_action=planner_action_dict,
+                planner_trace=combined_trace,
+                tool_result=aggregated_tool_result,
             )
 
-        # ---- SINGLE-STEP EXECUTION ----
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # SINGLE-STEP EXECUTION
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         is_safe, reason = tool_sandbox.validate_tool_call(
             tool_name=action.tool.value,
             args=action.tool_input.model_dump(exclude_none=True),
@@ -284,51 +331,83 @@ class ConversationOrchestrator:
             return OrchestratorResult(
                 ok=False,
                 reply="I can't process that request.",
-                planner_action=planner_action,
+                conversation_id=conversation.id,
+                turn_id=turn_id,
+                planner_action=planner_action_dict,
                 planner_trace=planner_trace,
                 error=f"tool_sandbox_rejected: {reason}",
             )
 
+        # ---- Pure chat ----
         if action.tool == PlannerTool.CHAT:
             reply = await self._generate_chat_reply(
                 msg_list=msg_list,
                 user_message=user_message,
             )
-        else:
-            tool_result: dict[str, Any] = {}
-            try:
-                tool = self.tool_registry.get(action.tool.value)
-                tool_result = await tool.execute(
-                    planner_action=action,
-                    conversation=None,
-                    turn=None,
-                    db=db,
-                )
-            except Exception:
-                pass
 
-            _intent_store[user_id] = LastUserIntent(
-                tool=action.tool.value,
-                intent_type="web" if action.tool == PlannerTool.WEB else action.tool.value,
-                entities=extract_entities_from_action(action, user_message),
-                timestamp=time.time(),
+            # Clear intent tracking on chat (no tool was used)
+            if user_id in _intent_store:
+                del _intent_store[user_id]
+
+            return OrchestratorResult(
+                ok=True,
+                reply=reply,
+                conversation_id=conversation.id,
+                turn_id=turn_id,
+                planner_action=planner_action_dict,
+                planner_trace=planner_trace,
             )
 
-            reply = await self._generate_chat_reply(
-                msg_list=msg_list,
-                user_message=user_message,
-                tool_result=tool_result if tool_result.get("ok") else None,
+        # ---- Tool execution ----
+        tool_result: dict[str, Any] = {}
+        try:
+            tool = self.tool_registry.get(action.tool.value)
+            tool_result = await tool.execute(
+                planner_action=action,
+                conversation=None,
+                turn=None,
+                db=effective_db,
             )
+        except Exception as exc:
+            tool_result = {"ok": False, "error": str(exc)}
+            planner_trace.append({
+                "stage": "tool_exception",
+                "summary": f"Tool {action.tool.value} raised exception",
+                "details": {"error": str(exc)},
+            })
 
-        if action.tool == PlannerTool.CHAT and user_id in _intent_store:
-            del _intent_store[user_id]
+        # Track intent for follow-up query reconstruction
+        _intent_store[user_id] = LastUserIntent(
+            tool=action.tool.value,
+            intent_type="web" if action.tool == PlannerTool.WEB else action.tool.value,
+            entities=extract_entities_from_action(action, user_message),
+            timestamp=time.time(),
+        )
+
+        # Generate reply using tool result as context
+        reply = await self._generate_chat_reply(
+            msg_list=msg_list,
+            user_message=user_message,
+            tool_result=tool_result if tool_result.get("ok") else None,
+        )
+
+        # Pass tool_result to frontend only if tool succeeded
+        # (frontend uses this for images, citations, etc.)
+        passthrough_tool_result = tool_result if tool_result.get("ok") else None
 
         return OrchestratorResult(
             ok=True,
             reply=reply,
-            planner_action=planner_action,
+            conversation_id=conversation.id,
+            turn_id=turn_id,
+            planner_action=planner_action_dict,
             planner_trace=planner_trace,
+            tool_result=passthrough_tool_result,
         )
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # LEGACY APIS — kept for backward compatibility
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     async def handle(
         self,
@@ -337,11 +416,16 @@ class ConversationOrchestrator:
         message: str,
         conversation_state: dict[str, Any],
     ) -> str:
+        """Legacy API — returns reply string only."""
+        class _MinimalConv:
+            def __init__(self, cid: int):
+                self.id = cid
+
         result = await self.handle_turn(
-            db=db,
-            user_id=user_id,
+            conversation=_MinimalConv(conversation_state.get("conversation_id", 0)),
             user_message=message,
-            conversation_state=conversation_state,
+            user_id=user_id,
+            db=db,
         )
         return result.reply
 
@@ -352,6 +436,7 @@ class ConversationOrchestrator:
         message: str,
         conversation_state: dict[str, Any],
     ):
+        """Legacy streaming API — direct model stream, no planner."""
         context_bundle = await context_builder.build(
             db=db,
             conversation_id=conversation_state.get("conversation_id"),
