@@ -2,7 +2,7 @@ import json
 
 from sqlalchemy.orm import Session
 
-from app.memory.memory_models import Memory
+from app.db.models import Memory
 from app.memory.embedding_service import embedding_service
 
 

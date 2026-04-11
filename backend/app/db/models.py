@@ -156,7 +156,8 @@ class Turn(Base):
     conversation: Mapped["Conversation"] = relationship(back_populates="turns")
     messages: Mapped[list["Message"]] = relationship(
         back_populates="turn",
-        foreign_keys="Message.turn_id",
+        foreign_keys="[Message.turn_id]",
+        primaryjoin="Turn.id == Message.turn_id",
     )
     tool_events: Mapped[list["ToolEvent"]] = relationship(back_populates="turn")
     artifacts: Mapped[list["Artifact"]] = relationship(back_populates="turn")
@@ -197,7 +198,10 @@ class Message(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")
-    turn: Mapped["Turn"] = relationship(back_populates="messages")
+    turn: Mapped["Turn"] = relationship(
+        back_populates="messages",
+        foreign_keys="[Message.turn_id]",
+    )
 
 
 # =========================

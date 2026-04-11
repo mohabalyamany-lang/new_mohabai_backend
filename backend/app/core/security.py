@@ -18,11 +18,13 @@ def utcnow() -> datetime:
 
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    import bcrypt
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    return pwd_context.verify(password, password_hash)
+    import bcrypt
+    return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
 
 
 def create_token(

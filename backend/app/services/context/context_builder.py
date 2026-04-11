@@ -3,7 +3,6 @@ from __future__ import annotations
 from sqlalchemy.orm import Session
 
 from app.memory.memory_retriever import memory_retriever
-from app.planner.planning_prompts import PLANNER_PROMPT
 from app.services.artifact_service import ArtifactService
 from app.services.context.context_types import ContextBundle, ContextMessage
 from app.services.context.conversation_memory_service import memory_service
@@ -19,6 +18,7 @@ You are Mohab AI, an advanced conversational agent.
 - Follow interaction policy (brief, talkative, casual, technical).
 - Never say you cannot do something if a tool exists.
 - When uncertain, ask a clarifying question before assuming.
+- When you have an image URL, present it directly to the user as a link.
 - Keep reasoning tight and actionable.
 - Ensure responses are accurate, helpful, and user-focused.
 """
@@ -67,8 +67,6 @@ class ContextBuilder:
                     )
                 )
 
-        # 3. PLANNER PROMPT — reasoning and tool decision instructions
-        messages.append(ContextMessage(role="system", content=PLANNER_PROMPT))
 
         # 4. INTERACTION PROMPT — tone and style rules
         messages.append(ContextMessage(role="system", content=INTERACTION_PROMPT))

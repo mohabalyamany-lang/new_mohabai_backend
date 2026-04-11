@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -18,6 +19,7 @@ from app.planner.contracts import (
     PlannerTool,
     PlannerTraceEntry,
     ToolInput,
+    PlannerStep,
 )
 from app.planner.state_resolver import (
     ResolvedConversationState,
@@ -160,7 +162,7 @@ class SemanticPlanner:
             '    "memory_content": null,\n'
             '    "artifact_id": null,\n'
             '    "metadata": {}\n'
-            "  },\n"
+            '  },\n'
             '  "uses_last_artifact": false,\n'
             '  "uses_pending_target": false,\n'
             '  "clear_pending_target": false,\n'
@@ -208,6 +210,54 @@ class SemanticPlanner:
     ) -> PlannerResult:
         normalized = normalize_text(user_message)
         trace: list[PlannerTraceEntry] = []
+
+        # Multi-intent detection
+        if detect_multi_intent(user_message):
+            parts = split_intents(user_message)
+            if len(parts) > 1:
+                steps = []
+                for i, part in enumerate(parts):
+                    try:
+                        # Use rule-based routing only — no recursive LLM calls
+                        if looks_like_image_request(part):
+                            tool = "image"
+                            intent = "image_gen"
+                            tool_input = {"image_instruction": part}
+                        elif needs_live_information(part):
+                            tool = "web"
+                            intent = "web_search"
+                            tool_input = {"query": part}
+                        else:
+                            tool = "chat"
+                            intent = "chat"
+                            tool_input = {}
+                        steps.append(PlannerStep(
+                            intent=intent,
+                            tool=tool,
+                            tool_input=tool_input,
+                            order=i,
+                        ))
+                    except Exception:
+                        continue
+                if steps:
+                    fallback_action = PlannerAction(
+                        intent=PlannerIntent.CHAT,
+                        tool=PlannerTool.CHAT,
+                        decision=PlannerDecision.ACT,
+                        conversation_mode=ConversationMode.NORMAL_CHAT,
+                        reason="multi_intent_decomposed",
+                        confidence=0.95,
+                    )
+                    return PlannerResult(
+                        action=fallback_action,
+                        steps=steps,
+                        is_multi_intent=True,
+                        trace=[PlannerTraceEntry(
+                            stage="multi_intent",
+                            summary=f"Decomposed into {len(steps)} steps",
+                            details={"parts": parts},
+                        )],
+                    )
 
         # Hard exits from sticky tool modes
         if is_style_request(user_message):
@@ -510,7 +560,7 @@ class SemanticPlanner:
         planner_context = PlannerContext(
             user_message=user_message,
             normalized_message=normalized,
-            state=state.__dict__,
+            state=vars(state) if hasattr(state, '__dict__') else {f.name: getattr(state, f.name) for f in state.__dataclass_fields__.values()},
             recent_messages=recent_messages or [],
         )
         trace.append(
@@ -590,3 +640,17 @@ class SemanticPlanner:
                 )
             ],
         )
+
+
+def detect_multi_intent(user_message: str) -> bool:
+    separators = [" and ", " then ", ", and ", " also "]
+    return any(sep in user_message.lower() for sep in separators)
+
+
+def split_intents(user_message: str) -> list[str]:
+    msg = user_message.replace(", and", " and").replace(", then", " then")
+    parts = msg.split(" and ")
+    return [p.strip() for p in parts if p.strip()]
+
+
+semantic_planner = SemanticPlanner()

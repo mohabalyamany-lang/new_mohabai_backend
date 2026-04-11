@@ -98,6 +98,15 @@ class PlannerTraceEntry(BaseModel):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
+class PlannerStep(BaseModel):
+    intent: str
+    tool: str
+    tool_input: dict[str, Any] = Field(default_factory=dict)
+    order: int = 0
+
+
 class PlannerResult(BaseModel):
     action: PlannerAction
     trace: list[PlannerTraceEntry] = Field(default_factory=list)
+    steps: list[PlannerStep] = Field(default_factory=list)
+    is_multi_intent: bool = False

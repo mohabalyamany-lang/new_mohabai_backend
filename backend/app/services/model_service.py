@@ -106,7 +106,7 @@ class OpenAIChatProvider(BaseChatProvider):
 class GroqChatProvider(BaseChatProvider):
     name = "groq"
 
-    def __init__(self, model: str = "llama-3.3-70b-versatile") -> None:
+    def __init__(self, model: str = "llama-3.1-8b-instant") -> None:
         self.model = model
         self.url = "https://api.groq.com/openai/v1/chat/completions"
         self._client = _groq_client
@@ -183,15 +183,15 @@ class ModelService:
 
     async def chat(self, messages: list[dict[str, str]], max_tokens: int = 1200) -> str:
         """Standard non-streaming completion. Returns the text content directly."""
-        last_error: Exception | None = None
+        all_errors: list[str] = []
         for provider in self.providers:
             try:
                 response = await provider.complete(messages=messages, max_tokens=max_tokens)
                 return response.content
             except Exception as exc:
-                last_error = exc
+                all_errors.append(f"{provider.name}: {exc}")
                 continue
-        raise RuntimeError(f"All model providers failed: {last_error}")
+        raise RuntimeError(f"All model providers failed: {'; '.join(all_errors)}")
 
     async def stream(self, messages: list[dict[str, str]], max_tokens: int = 1200) -> AsyncIterator[str]:
         """Streaming completion. Yields chunks of text strings."""

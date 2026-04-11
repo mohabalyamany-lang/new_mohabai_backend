@@ -8,7 +8,7 @@ import numpy as np
 from sqlalchemy.orm import Session
 
 from app.memory.embedding_service import embedding_service
-from app.memory.memory_models import Memory
+from app.db.models import Memory
 
 # Simple in-process embedding cache
 # key: query string → value: (embedding_list, timestamp)
