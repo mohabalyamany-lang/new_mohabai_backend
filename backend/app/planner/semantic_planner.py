@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any
 
 import httpx
@@ -42,6 +43,51 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 ZAI_URL = "https://api.z.ai/v1/chat/completions"
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# PRODUCTION JSON EXTRACTION
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def extract_json(content: str) -> dict | None:
+    """Production-grade JSON extraction from LLM output.
+    
+    Handles:
+    - ```json ... ``` fences
+    - ``` ... ``` fences  
+    - Leading explanations before JSON
+    - Trailing comments after JSON
+    - Partial JSON (finds first complete object)
+    """
+    if not content:
+        return None
+
+    content = content.strip()
+
+    # remove markdown fences
+    if content.startswith("```"):
+        parts = content.split("```")
+        if len(parts) >= 2:
+            content = parts[1]
+            # remove language identifier if present (json, JSON, etc.)
+            for lang in ("json", "JSON", "Json"):
+                if content.startswith(lang):
+                    content = content[len(lang):]
+                    break
+            content = content.strip()
+
+    # find first valid JSON object boundaries
+    start = content.find("{")
+    end = content.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    candidate = content[start:end + 1]
+
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+
+
 class SemanticPlannerOutput(BaseModel):
     intent: str
     tool: str
@@ -71,23 +117,35 @@ class SemanticPlanner:
         self.providers = self._build_provider_configs()
 
     def _build_provider_configs(self) -> list[dict[str, Any]]:
+        """Build provider list in PRODUCTION priority order.
+        
+        Order matters — first successful response wins.
+        Planner requires strict JSON compliance, deterministic structure,
+        low hallucination. OpenAI-class models are safest for this.
+        
+        Order:
+        1. OpenAI (gpt-4.1-mini)  → PRIMARY planner brain
+        2. Groq (llama-3.1-8b)    → FAST fallback
+        3. OpenRouter (gemma-3)   → diversity fallback
+        4. ZAI (glm-4.5-flash)    → LAST fallback only
+        """
         providers: list[dict[str, Any]] = []
 
-# 1. GLM-4.5 (Primary Intelligence)
-        if settings.zai_api_key:
+        # 1. OpenAI — PRIMARY (best JSON compliance + instruction adherence)
+        if settings.openai_api_key:
             providers.append(
                 {
-                    "name": "zai_glm",
-                    "url": ZAI_URL,
+                    "name": "openai",
+                    "url": OPENAI_URL,
                     "headers": {
-                        "Authorization": f"Bearer {settings.zai_api_key}",
+                        "Authorization": f"Bearer {settings.openai_api_key}",
                         "Content-Type": "application/json",
                     },
-                    "model": "glm-4.5-flash",
+                    "model": "gpt-4.1-mini",
                 }
             )
 
-        # 2. Groq (High-Speed Fallback)
+        # 2. Groq — HIGH-SPEED fallback
         if settings.groq_api_key:
             providers.append(
                 {
@@ -101,7 +159,7 @@ class SemanticPlanner:
                 }
             )
 
-        # 3. OpenRouter (Backup)
+        # 3. OpenRouter — backup diversity
         if settings.openrouter_api_key:
             providers.append(
                 {
@@ -117,17 +175,17 @@ class SemanticPlanner:
                 }
             )
 
-        # 4. OpenAI (Premium Fallback)
-        if settings.openai_api_key:
+        # 4. ZAI (GLM-4.5) — LAST fallback only (weaker JSON consistency)
+        if settings.zai_api_key:
             providers.append(
                 {
-                    "name": "openai",
-                    "url": OPENAI_URL,
+                    "name": "zai_glm",
+                    "url": ZAI_URL,
                     "headers": {
-                        "Authorization": f"Bearer {settings.openai_api_key}",
+                        "Authorization": f"Bearer {settings.zai_api_key}",
                         "Content-Type": "application/json",
                     },
-                    "model": "gpt-4.1-mini",
+                    "model": "glm-4.5-flash",
                 }
             )
 
@@ -164,7 +222,10 @@ class SemanticPlanner:
             "6. If the user says 'look it up' after a live-info request, resolve that reference.\n"
             "7. When using tools, produce concrete tool_input, not placeholders.\n"
             "8. Do not narrate capability limitations. Plan the action.\n\n"
-            "9. If the user shares personal details (name, job, preferences), use memory_write.\n\n"
+            "9. If the user shares personal details (name, job, preferences), use memory_write.\n"
+            "   For memory_write, set tool_input.memory_content to the fact to store.\n"
+            "   Set tool_input.memory_operation to 'store'.\n"
+            "   Set confidence to 0.90+ only if the detail is clearly factual and worth remembering.\n\n"
             "JSON schema:\n"
             "{\n"
             '  "intent": "chat",\n'
@@ -194,6 +255,7 @@ class SemanticPlanner:
         )
 
     async def _classify_sub_intent(self, text: str) -> tuple[str, str, dict]:
+        """Fast sub-intent classifier for multi-intent decomposition."""
         # Fast deterministic overrides first
         if looks_like_image_request(text):
             return "image_gen", "image", {"image_instruction": text}
@@ -220,11 +282,10 @@ class SemanticPlanner:
                         continue
 
                     data = r.json()["choices"][0]["message"]["content"]
-                    # Handle possible markdown wrapping
-                    if "```json" in data:
-                        data = data.split("```json")[1].split("```")[0].strip()
-                    
-                    parsed = json.loads(data)
+                    parsed = extract_json(data)
+                    if not parsed:
+                        continue
+
                     intent = parsed.get("intent", "chat")
 
                     if intent == "image_gen":
@@ -239,7 +300,26 @@ class SemanticPlanner:
 
         return "chat", "chat", {}
 
-    async def _provider_call(self, provider: dict[str, Any], planner_context: PlannerContext) -> SemanticPlannerOutput | None:
+    async def _provider_call(
+        self,
+        provider: dict[str, Any],
+        planner_context: PlannerContext,
+    ) -> tuple[SemanticPlannerOutput | None, dict[str, Any]]:
+        """Call a single provider and return (result, trace_info).
+        
+        trace_info contains:
+        - provider_name
+        - success: bool
+        - latency_ms: int
+        - error: str | None
+        """
+        trace_info = {
+            "provider_name": provider["name"],
+            "success": False,
+            "latency_ms": 0,
+            "error": None,
+        }
+
         payload = {
             "model": provider["model"],
             "temperature": 0,
@@ -251,6 +331,8 @@ class SemanticPlanner:
             ],
         }
 
+        started = time.perf_counter()
+
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=4.0)) as client:
                 response = await client.post(
@@ -258,20 +340,50 @@ class SemanticPlanner:
                     headers=provider["headers"],
                     json=payload,
                 )
+
+                latency_ms = int((time.perf_counter() - started) * 1000)
+                trace_info["latency_ms"] = latency_ms
+
                 if response.status_code != 200:
-                    return None
+                    trace_info["error"] = f"status_{response.status_code}"
+                    return None, trace_info
+
                 data = response.json()
                 content = data["choices"][0]["message"]["content"]
-                # Strip markdown code blocks if present
-                if content.startswith("```json"):
-                    content = content.split("```json")[1].split("```")[0].strip()
-                elif content.startswith("```"):
-                    content = content.split("```")[1].split("```")[0].strip()
-                    
-                parsed = json.loads(content)
-                return SemanticPlannerOutput.model_validate(parsed)
-        except (httpx.HTTPError, KeyError, json.JSONDecodeError, ValidationError):
-            return None
+
+                # Use production-grade JSON extraction
+                parsed = extract_json(content)
+                if not parsed:
+                    trace_info["error"] = "json_extraction_failed"
+                    return None, trace_info
+
+                result = SemanticPlannerOutput.model_validate(parsed)
+                trace_info["success"] = True
+                return result, trace_info
+
+        except httpx.HTTPError as exc:
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            trace_info["latency_ms"] = latency_ms
+            trace_info["error"] = f"http_error: {type(exc).__name__}"
+            return None, trace_info
+
+        except (KeyError, IndexError) as exc:
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            trace_info["latency_ms"] = latency_ms
+            trace_info["error"] = f"response_structure_error: {exc}"
+            return None, trace_info
+
+        except ValidationError as exc:
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            trace_info["latency_ms"] = latency_ms
+            trace_info["error"] = f"validation_error: {exc.error_count()}_issues"
+            return None, trace_info
+
+        except Exception as exc:
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            trace_info["latency_ms"] = latency_ms
+            trace_info["error"] = f"unexpected: {type(exc).__name__}"
+            return None, trace_info
 
     async def plan(
         self,
@@ -282,7 +394,7 @@ class SemanticPlanner:
         normalized = normalize_text(user_message)
         trace: list[PlannerTraceEntry] = []
 
-        # Multi-intent detection
+        # ━━━ Multi-intent detection ━━━
         if detect_multi_intent(user_message):
             parts = split_intents(user_message)
             if len(parts) > 1:
@@ -314,11 +426,11 @@ class SemanticPlanner:
                         trace=[PlannerTraceEntry(
                             stage="multi_intent",
                             summary=f"Decomposed into {len(steps)} steps",
-                            details={"parts": parts},
+                            details={"parts": parts, "steps": [s.__dict__ for s in steps]},
                         )],
                     )
 
-        # Hard exits from sticky tool modes
+        # ━━━ Hard exits from sticky tool modes ━━━
         if is_style_request(user_message):
             return PlannerResult(
                 action=PlannerAction(
@@ -437,7 +549,7 @@ class SemanticPlanner:
                 ],
             )
 
-        # Clean deterministic image cases
+        # ━━━ Deterministic image cases ━━━
         if state.last_artifact_type == "image":
             if looks_like_image_question(user_message):
                 return PlannerResult(
@@ -510,7 +622,7 @@ class SemanticPlanner:
                     ],
                 )
 
-        # Follow-up lookup against pending live target
+        # ━━━ Follow-up lookup against pending live target ━━━
         if (
             state.pending_followup_kind == "live_info"
             and state.pending_followup_target
@@ -546,7 +658,7 @@ class SemanticPlanner:
                 ],
             )
 
-        # Simple deterministic live-info routing
+        # ━━━ Simple deterministic live-info routing ━━━
         if needs_live_information(user_message) or is_live_info_intent(user_message):
             return PlannerResult(
                 action=PlannerAction(
@@ -577,7 +689,7 @@ class SemanticPlanner:
                 ],
             )
 
-        # Controlled image generation
+        # ━━━ Controlled image generation ━━━
         if looks_like_image_request(user_message):
             if any([
                 is_social_feedback(user_message),
@@ -614,9 +726,9 @@ class SemanticPlanner:
                     ],
                 )
 
-        # Ensure state is a dictionary for the LLM context
-        state_dict = state.model_dump() if hasattr(state, 'model_dump') else vars(state)
-        
+        # ━━━ Semantic LLM planner (with observability) ━━━
+        state_dict = state.model_dump() if hasattr(state, "model_dump") else vars(state)
+
         planner_context = PlannerContext(
             user_message=user_message,
             normalized_message=normalized,
@@ -627,14 +739,52 @@ class SemanticPlanner:
             PlannerTraceEntry(
                 stage="semantic",
                 summary="Escalating to semantic planner",
-                details={"message": user_message},
+                details={
+                    "message": user_message,
+                    "providers_available": [p["name"] for p in self.providers],
+                },
             )
         )
 
         for provider in self.providers:
-            semantic = await self._provider_call(provider, planner_context)
+            # Trace: provider attempt
+            trace.append(
+                PlannerTraceEntry(
+                    stage="provider_attempt",
+                    summary=f"Trying {provider['name']}",
+                    details={"model": provider["model"]},
+                )
+            )
+
+            semantic, trace_info = await self._provider_call(provider, planner_context)
+
             if semantic is None:
+                # Trace: provider failure
+                trace.append(
+                    PlannerTraceEntry(
+                        stage="provider_failure",
+                        summary=f"{provider['name']} failed",
+                        details={
+                            "latency_ms": trace_info["latency_ms"],
+                            "error": trace_info["error"],
+                        },
+                    )
+                )
                 continue
+
+            # Trace: provider success
+            trace.append(
+                PlannerTraceEntry(
+                    stage="provider_success",
+                    summary=f"{provider['name']} succeeded",
+                    details={
+                        "latency_ms": trace_info["latency_ms"],
+                        "intent": semantic.intent,
+                        "tool": semantic.tool,
+                        "confidence": semantic.confidence,
+                    },
+                )
+            )
 
             try:
                 action = PlannerAction(
@@ -662,17 +812,32 @@ class SemanticPlanner:
                     confidence=semantic.confidence,
                 )
             except ValueError:
+                trace.append(
+                    PlannerTraceEntry(
+                        stage="provider_failure",
+                        summary=f"{provider['name']} produced invalid enum values",
+                        details={
+                            "intent": semantic.intent,
+                            "tool": semantic.tool,
+                        },
+                    )
+                )
                 continue
 
             trace.append(
                 PlannerTraceEntry(
                     stage="semantic_result",
                     summary="Semantic planner returned action",
-                    details={"provider": provider["name"], "intent": semantic.intent, "tool": semantic.tool},
+                    details={
+                        "provider": provider["name"],
+                        "intent": semantic.intent,
+                        "tool": semantic.tool,
+                    },
                 )
             )
             return PlannerResult(action=action, trace=trace)
 
+        # ━━━ Fallback: all providers failed ━━━
         return PlannerResult(
             action=PlannerAction(
                 intent=PlannerIntent.CHAT,
@@ -691,22 +856,25 @@ class SemanticPlanner:
                 reason="fallback_to_chat",
                 confidence=0.55,
             ),
-            trace=trace
-            + [
+            trace=trace + [
                 PlannerTraceEntry(
                     stage="fallback",
-                    summary="Planner defaulted to chat",
-                    details={},
+                    summary="All providers failed, planner defaulted to chat",
+                    details={"providers_tried": len(self.providers)},
                 )
             ],
         )
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# MODULE-LEVEL HELPERS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 def is_live_info_intent(text: str) -> bool:
     text = text.lower()
     keywords = [
         "weather", "price", "stock", "bitcoin", "time",
-        "news", "score", "temperature", "today", "tomorrow"
+        "news", "score", "temperature", "today", "tomorrow",
     ]
     return any(k in text for k in keywords)
 
