@@ -39,6 +39,7 @@ settings = get_settings()
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+ZAI_URL = "https://api.z.ai/v1/chat/completions"
 
 
 class SemanticPlannerOutput(BaseModel):
@@ -72,19 +73,7 @@ class SemanticPlanner:
     def _build_provider_configs(self) -> list[dict[str, Any]]:
         providers: list[dict[str, Any]] = []
 
-        if settings.openai_api_key:
-            providers.append(
-                {
-                    "name": "openai",
-                    "url": OPENAI_URL,
-                    "headers": {
-                        "Authorization": f"Bearer {settings.openai_api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    "model": "gpt-4.1-mini",
-                }
-            )
-
+        # 1. Groq (Fast, Cheap)
         if settings.groq_api_key:
             providers.append(
                 {
@@ -98,6 +87,21 @@ class SemanticPlanner:
                 }
             )
 
+        # 2. GLM-4.5 (Fallback Reasoning)
+        if settings.zai_api_key:
+            providers.append(
+                {
+                    "name": "zai_glm",
+                    "url": ZAI_URL,
+                    "headers": {
+                        "Authorization": f"Bearer {settings.zai_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    "model": "glm-4.5-flash",
+                }
+            )
+
+        # 3. OpenRouter (Backup)
         if settings.openrouter_api_key:
             providers.append(
                 {
@@ -110,6 +114,20 @@ class SemanticPlanner:
                         "X-Title": "Mohab AI Planner",
                     },
                     "model": "google/gemma-3-12b-it:free",
+                }
+            )
+
+        # 4. OpenAI (Premium Fallback)
+        if settings.openai_api_key:
+            providers.append(
+                {
+                    "name": "openai",
+                    "url": OPENAI_URL,
+                    "headers": {
+                        "Authorization": f"Bearer {settings.openai_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    "model": "gpt-4.1-mini",
                 }
             )
 
@@ -174,6 +192,52 @@ class SemanticPlanner:
             "}\n"
         )
 
+    async def _classify_sub_intent(self, text: str) -> tuple[str, str, dict]:
+        # Fast deterministic overrides first
+        if looks_like_image_request(text):
+            return "image_gen", "image", {"image_instruction": text}
+
+        if is_live_info_intent(text):
+            return "web_search", "web", {"query": text}
+
+        # fallback to semantic LLM (cheap model)
+        for provider in self.providers:
+            try:
+                payload = {
+                    "model": provider["model"],
+                    "temperature": 0,
+                    "max_tokens": 100,
+                    "messages": [
+                        {"role": "system", "content": "Classify intent: chat, web_search, image_gen. Return JSON."},
+                        {"role": "user", "content": text},
+                    ],
+                }
+
+                async with httpx.AsyncClient(timeout=6) as client:
+                    r = await client.post(provider["url"], headers=provider["headers"], json=payload)
+                    if r.status_code != 200:
+                        continue
+
+                    data = r.json()["choices"][0]["message"]["content"]
+                    # Handle possible markdown wrapping
+                    if "```json" in data:
+                        data = data.split("```json")[1].split("```")[0].strip()
+                    
+                    parsed = json.loads(data)
+                    intent = parsed.get("intent", "chat")
+
+                    if intent == "image_gen":
+                        return "image_gen", "image", {"image_instruction": text}
+                    if intent == "web_search":
+                        return "web_search", "web", {"query": text}
+
+                    return "chat", "chat", {}
+
+            except Exception:
+                continue
+
+        return "chat", "chat", {}
+
     async def _provider_call(self, provider: dict[str, Any], planner_context: PlannerContext) -> SemanticPlannerOutput | None:
         payload = {
             "model": provider["model"],
@@ -218,19 +282,7 @@ class SemanticPlanner:
                 steps = []
                 for i, part in enumerate(parts):
                     try:
-                        # Use rule-based routing only — no recursive LLM calls
-                        if looks_like_image_request(part):
-                            tool = "image"
-                            intent = "image_gen"
-                            tool_input = {"image_instruction": part}
-                        elif needs_live_information(part):
-                            tool = "web"
-                            intent = "web_search"
-                            tool_input = {"query": part}
-                        else:
-                            tool = "chat"
-                            intent = "chat"
-                            tool_input = {}
+                        intent, tool, tool_input = await self._classify_sub_intent(part)
                         steps.append(PlannerStep(
                             intent=intent,
                             tool=tool,
@@ -346,7 +398,6 @@ class SemanticPlanner:
                 ],
             )
 
-        # FIX 3 — HARD EXIT: user is clearly switching context to meta/identity questions
         if any([
             "who are you" in user_message.lower(),
             "what are you" in user_message.lower(),
@@ -452,7 +503,7 @@ class SemanticPlanner:
                     ],
                 )
 
-        # FIX 4 — Follow-up lookup against pending live target (improved condition)
+        # Follow-up lookup against pending live target
         if (
             state.pending_followup_kind == "live_info"
             and state.pending_followup_target
@@ -489,7 +540,7 @@ class SemanticPlanner:
             )
 
         # Simple deterministic live-info routing
-        if needs_live_information(user_message):
+        if needs_live_information(user_message) or is_live_info_intent(user_message):
             return PlannerResult(
                 action=PlannerAction(
                     intent=PlannerIntent.WEB_SEARCH,
@@ -519,15 +570,14 @@ class SemanticPlanner:
                 ],
             )
 
-        # Controlled image generation (NOT trigger-happy)
+        # Controlled image generation
         if looks_like_image_request(user_message):
-            # HARD GUARD: prevent accidental triggering from normal conversation
             if any([
                 is_social_feedback(user_message),
                 is_style_request(user_message),
                 is_general_chat_switch(user_message),
             ]):
-                pass  # DO NOT route to image
+                pass
             else:
                 return PlannerResult(
                     action=PlannerAction(
@@ -642,9 +692,24 @@ class SemanticPlanner:
         )
 
 
+def is_live_info_intent(text: str) -> bool:
+    text = text.lower()
+    keywords = [
+        "weather", "price", "stock", "bitcoin", "time",
+        "news", "score", "temperature", "today", "tomorrow"
+    ]
+    return any(k in text for k in keywords)
+
+
 def detect_multi_intent(user_message: str) -> bool:
-    separators = [" and ", " then ", ", and ", " also "]
-    return any(sep in user_message.lower() for sep in separators)
+    text = user_message.lower()
+    if " and " not in text:
+        return False
+
+    # must contain at least 2 verbs/actions to qualify as multiple tasks
+    triggers = ["generate", "create", "tell", "explain", "search", "find", "show"]
+    count = sum(1 for t in triggers if t in text)
+    return count >= 2
 
 
 def split_intents(user_message: str) -> list[str]:
