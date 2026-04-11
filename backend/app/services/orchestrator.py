@@ -183,11 +183,19 @@ class ConversationOrchestrator:
             for m in context_bundle.messages
         ]
 
+        # ---- Memory retrieval (before planning) ----
+        memory_service = MemoryService(effective_db)
+        memories = memory_service.search_relevant(
+            query=user_message,
+            user_id=user_id,
+        )
+
         # ---- Plan ----
         state = ResolvedConversationState()
         planner_result = await semantic_planner.plan(
             user_message=augmented_message,
             state=state,
+            memories=memories,
         )
 
         action = planner_result.action
@@ -217,7 +225,6 @@ class ConversationOrchestrator:
             memory_operation = getattr(action.tool_input, "memory_operation", None)
             confidence = action.confidence or 0.0
 
-            memory_service = MemoryService(effective_db)
             memory = memory_service.add_memory_from_planner(
                 user_id=user_id,
                 memory_content=memory_content,
@@ -280,6 +287,7 @@ class ConversationOrchestrator:
                 conversation=conversation,
                 turn=None,
                 db=effective_db,
+                memories=memories,
             )
 
             exec_trace = [e.model_dump(mode="json") for e in exec_result.trace]
