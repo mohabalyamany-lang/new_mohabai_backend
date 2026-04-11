@@ -390,6 +390,7 @@ class SemanticPlanner:
         user_message: str,
         state: ResolvedConversationState,
         recent_messages: list[dict[str, str]] | None = None,
+        memories: list[dict[str, Any]] | None = None,
     ) -> PlannerResult:
         normalized = normalize_text(user_message)
         trace: list[PlannerTraceEntry] = []
@@ -727,7 +728,12 @@ class SemanticPlanner:
                 )
 
         # ━━━ Semantic LLM planner (with observability) ━━━
+        # Ensure state is a dictionary for the LLM context
         state_dict = state.model_dump() if hasattr(state, "model_dump") else vars(state)
+
+        # Inject memories into planner state (budget-limited by memory_service)
+        if memories:
+            state_dict["memory"] = memories
 
         planner_context = PlannerContext(
             user_message=user_message,
