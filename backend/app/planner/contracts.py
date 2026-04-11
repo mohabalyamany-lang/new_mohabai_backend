@@ -103,6 +103,7 @@ class PlannerStep(BaseModel):
     tool: str
     tool_input: dict[str, Any] = Field(default_factory=dict)
     order: int = 0
+    depends_on: list[int] | None = None
 
 
 class PlannerResult(BaseModel):
