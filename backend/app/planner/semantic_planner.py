@@ -73,21 +73,7 @@ class SemanticPlanner:
     def _build_provider_configs(self) -> list[dict[str, Any]]:
         providers: list[dict[str, Any]] = []
 
-        # 1. Groq (Fast, Cheap)
-        if settings.groq_api_key:
-            providers.append(
-                {
-                    "name": "groq",
-                    "url": GROQ_URL,
-                    "headers": {
-                        "Authorization": f"Bearer {settings.groq_api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    "model": "llama-3.1-8b-instant",
-                }
-            )
-
-        # 2. GLM-4.5 (Fallback Reasoning)
+# 1. GLM-4.5 (Primary Intelligence)
         if settings.zai_api_key:
             providers.append(
                 {
@@ -98,6 +84,20 @@ class SemanticPlanner:
                         "Content-Type": "application/json",
                     },
                     "model": "glm-4.5-flash",
+                }
+            )
+
+        # 2. Groq (High-Speed Fallback)
+        if settings.groq_api_key:
+            providers.append(
+                {
+                    "name": "groq",
+                    "url": GROQ_URL,
+                    "headers": {
+                        "Authorization": f"Bearer {settings.groq_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    "model": "llama-3.1-8b-instant",
                 }
             )
 
@@ -164,6 +164,7 @@ class SemanticPlanner:
             "6. If the user says 'look it up' after a live-info request, resolve that reference.\n"
             "7. When using tools, produce concrete tool_input, not placeholders.\n"
             "8. Do not narrate capability limitations. Plan the action.\n\n"
+            "9. If the user shares personal details (name, job, preferences), use memory_write.\n\n"
             "JSON schema:\n"
             "{\n"
             '  "intent": "chat",\n'
@@ -208,7 +209,7 @@ class SemanticPlanner:
                     "temperature": 0,
                     "max_tokens": 100,
                     "messages": [
-                        {"role": "system", "content": "Classify intent: chat, web_search, image_gen. Return JSON."},
+                        {"role": "system", "content": "You are a sub-intent classifier. Respond ONLY with JSON: {\"intent\": \"chat\" | \"web_search\" | \"image_gen\"}. Choose web_search for facts/news, image_gen for creating art, and chat for conversation."},
                         {"role": "user", "content": text},
                     ],
                 }
@@ -261,6 +262,12 @@ class SemanticPlanner:
                     return None
                 data = response.json()
                 content = data["choices"][0]["message"]["content"]
+                # Strip markdown code blocks if present
+                if content.startswith("```json"):
+                    content = content.split("```json")[1].split("```")[0].strip()
+                elif content.startswith("```"):
+                    content = content.split("```")[1].split("```")[0].strip()
+                    
                 parsed = json.loads(content)
                 return SemanticPlannerOutput.model_validate(parsed)
         except (httpx.HTTPError, KeyError, json.JSONDecodeError, ValidationError):
@@ -607,10 +614,13 @@ class SemanticPlanner:
                     ],
                 )
 
+        # Ensure state is a dictionary for the LLM context
+        state_dict = state.model_dump() if hasattr(state, 'model_dump') else vars(state)
+        
         planner_context = PlannerContext(
             user_message=user_message,
             normalized_message=normalized,
-            state=vars(state) if hasattr(state, '__dict__') else {f.name: getattr(state, f.name) for f in state.__dataclass_fields__.values()},
+            state=state_dict,
             recent_messages=recent_messages or [],
         )
         trace.append(
