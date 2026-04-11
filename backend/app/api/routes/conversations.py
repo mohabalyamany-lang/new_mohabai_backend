@@ -1,38 +1,49 @@
-from __future__ import annotations
-
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel
-from sqlalchemy.orm import Session
-
-from app.db.session import get_db_session
-from app.services.conversation_service import ConversationService
-
-router = APIRouter(prefix="/conversations", tags=["conversations"])
-
-
-class CreateConversationRequest(BaseModel):
-    user_id: int
-    title: str | None = None
-
-
-class CreateConversationResponse(BaseModel):
-    ok: bool
-    conversation_id: int
-    title: str | None
-
-
-@router.post("", response_model=CreateConversationResponse)
-async def create_conversation(
-    payload: CreateConversationRequest,
+@router.get("", response_model=list[ConversationResponse])
+async def list_conversations(
     db: Session = Depends(get_db_session),
-) -> CreateConversationResponse:
-    service = ConversationService(db)
-    conversation = service.create_conversation(
-        user_id=payload.user_id,
-        title=payload.title,
-    )
-    return CreateConversationResponse(
+    user: User = Depends(get_current_user),
+):
+    convos = db.query(Conversation).filter(
+        Conversation.user_id == user.id
+    ).order_by(Conversation.updated_at.desc()).all()
+    return [ConversationResponse(
         ok=True,
-        conversation_id=conversation.id,
-        title=conversation.title,
-    )
+        conversation_id=c.id,
+        public_id=c.public_id,
+        title=c.title,
+    ) for c in convos]
+
+
+@router.patch("/{conversation_id}")
+async def rename_conversation(
+    conversation_id: int,
+    payload: dict,
+    db: Session = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    convo = db.query(Conversation).filter(
+        Conversation.id == conversation_id,
+        Conversation.user_id == user.id,
+    ).first()
+    if not convo:
+        raise HTTPException(status_code=404, detail="Not found")
+    convo.title = payload.get("title", convo.title)
+    db.commit()
+    return {"ok": True}
+
+
+@router.delete("/{conversation_id}")
+async def delete_conversation(
+    conversation_id: int,
+    db: Session = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    convo = db.query(Conversation).filter(
+        Conversation.id == conversation_id,
+        Conversation.user_id == user.id,
+    ).first()
+    if not convo:
+        raise HTTPException(status_code=404, detail="Not found")
+    db.delete(convo)
+    db.commit()
+    return {"ok": True}
