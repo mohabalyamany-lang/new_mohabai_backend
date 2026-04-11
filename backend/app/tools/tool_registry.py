@@ -24,7 +24,6 @@ class ImageTool(BaseTool):
     async def execute(self, planner_action, conversation, turn, db):
         tool_input = planner_action.tool_input
 
-        # IMAGE GENERATION
         if planner_action.intent.value == "image_gen":
             result = await self.provider.generate(tool_input.image_instruction)
 
@@ -49,7 +48,6 @@ class ImageTool(BaseTool):
                 },
             }
 
-        # IMAGE EDIT
         if planner_action.intent.value == "image_edit":
             result = await self.provider.edit(
                 instruction=tool_input.image_instruction,
@@ -79,7 +77,12 @@ class ImageTool(BaseTool):
                 },
             }
 
-        return {"ok": False, "result_type": "error", "content": None, "error": "Unsupported image action"}
+        return {
+            "ok": False,
+            "result_type": "error",
+            "content": None,
+            "error": "Unsupported image action",
+        }
 
 
 # ---------------- WEB TOOL ----------------
@@ -88,25 +91,26 @@ class WebTool(BaseTool):
     name = "web"
 
     async def execute(self, planner_action, conversation, turn, db):
-        # ━── Use previous_output if injected by execution engine ━──
         tool_input = planner_action.tool_input
+        input_dict = tool_input.model_dump()
         query = tool_input.query
 
-        # If no explicit query but we have previous_output, 
-        # the user likely said "summarize it" after a search
-        previous_output = tool_input.model_dump().get("previous_output")
+        # ━━━ SAFE previous_output consumption ━━━
+        # Only consume previous output when explicitly flagged by execution engine.
+        # The flag is set ONLY after type-aware filtering + budget control.
+        use_previous = input_dict.get("use_previous_output", False)
+        previous_output = input_dict.get("previous_output")
 
-        if not query and previous_output:
-            # This step is consuming previous search results
+        if not query and previous_output and use_previous:
+            # This step is explicitly consuming filtered previous output
             return {
                 "ok": True,
                 "result_type": "web_result",
                 "content": previous_output,
                 "structured": {"source": "previous_step"},
-                "citations": tool_input.model_dump().get("previous_citations", []),
+                "citations": input_dict.get("previous_citations", []),
                 "state_patch": {
                     "pending_followup_kind": "live_info",
-                    "pending_followup_target": query,
                     "allow_context_carryover": True,
                 },
             }
@@ -116,9 +120,10 @@ class WebTool(BaseTool):
                 "ok": False,
                 "result_type": "error",
                 "content": None,
-                "error": "Missing query",
+                "error": "Missing query and no valid previous output",
             }
 
+        # ━━━ Normal web search ━━━
         results = await web_search(query)
         content = results.get("content", "")
         citations = results.get("citations", [])
@@ -146,16 +151,13 @@ class ChatTool(BaseTool):
     name = "chat"
 
     async def execute(self, planner_action, conversation, turn, db):
-        tool_input = planner_action.tool_input
-        previous_output = tool_input.model_dump().get("previous_output")
-
-        # If chat step has previous_output, pass it through
-        # The execution engine's synthesis will handle the actual LLM call
+        # Chat tool never consumes previous_output directly.
+        # The execution engine's synthesis layer handles this.
         return {
             "ok": True,
             "result_type": "chat_result",
-            "content": previous_output or None,
-            "structured": {"source": "previous_step" if previous_output else "direct"},
+            "content": None,
+            "structured": {"source": "direct"},
         }
 
 
