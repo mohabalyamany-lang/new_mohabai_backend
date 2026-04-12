@@ -38,7 +38,6 @@ class OrchestratorResult:
 
     @property
     def assistant_text(self) -> str | None:
-        """Alias for reply — used by stream_chat endpoint."""
         return self.reply if self.ok else None
 
 
@@ -146,15 +145,6 @@ class ConversationOrchestrator:
         user_id: int,
         db: Session | None = None,
     ) -> OrchestratorResult:
-        """
-        Main entry point for handling a user turn.
-
-        Args:
-            conversation: SQLAlchemy Conversation model (must have .id)
-            user_message: Raw user message string
-            user_id: Authenticated user ID
-            db: Optional DB session override (uses self.db if not provided)
-        """
         from app.planner.state_resolver import ResolvedConversationState
 
         effective_db = db or self.db
@@ -183,9 +173,9 @@ class ConversationOrchestrator:
             for m in context_bundle.messages
         ]
 
-        # ---- Memory retrieval (before planning) ----
+        # ---- Memory retrieval (async — delegates to embedding-based retriever) ----
         memory_service = MemoryService(effective_db)
-        memories = memory_service.search_relevant(
+        memories = await memory_service.search_relevant(
             query=user_message,
             user_id=user_id,
         )
@@ -217,15 +207,13 @@ class ConversationOrchestrator:
             action.tool_input = ToolInput(query=combined_query)
             planner_action_dict = action.model_dump(mode="json")
 
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # MEMORY WRITE — LLM suggests, system decides
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # ━━━ MEMORY WRITE ━━━
         if action.intent.value == "memory_write":
             memory_content = getattr(action.tool_input, "memory_content", None)
             memory_operation = getattr(action.tool_input, "memory_operation", None)
             confidence = action.confidence or 0.0
 
-            memory = memory_service.add_memory_from_planner(
+            memory = await memory_service.add_memory_from_planner(
                 user_id=user_id,
                 memory_content=memory_content,
                 memory_operation=memory_operation,
@@ -236,11 +224,10 @@ class ConversationOrchestrator:
                 reply = "Got it, I'll remember that."
                 planner_trace.append({
                     "stage": "memory_stored",
-                    "summary": "Memory validated and stored",
-                    "details": {"memory_id": memory.id},
+                    "summary": "Memory validated and stored via embedding pipeline",
+                    "details": {},
                 })
             else:
-                # Memory rejected by validation — fall through to normal chat
                 planner_trace.append({
                     "stage": "memory_rejected",
                     "summary": "Memory validation rejected the write",
@@ -260,11 +247,8 @@ class ConversationOrchestrator:
                 planner_trace=planner_trace,
             )
 
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # MULTI-INTENT → Execution Engine
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # ━━━ MULTI-INTENT → Execution Engine ━━━
         if planner_result.is_multi_intent and planner_result.steps:
-            # Validate all steps through sandbox before executing
             for step in planner_result.steps:
                 is_safe, reason = tool_sandbox.validate_tool_call(
                     tool_name=step.tool,
@@ -293,7 +277,6 @@ class ConversationOrchestrator:
             exec_trace = [e.model_dump(mode="json") for e in exec_result.trace]
             combined_trace = planner_trace + exec_trace
 
-            # Check if execution completely failed
             if exec_result.error and not exec_result.final_response:
                 return OrchestratorResult(
                     ok=False,
@@ -305,7 +288,6 @@ class ConversationOrchestrator:
                     error=exec_result.error,
                 )
 
-            # Build aggregated tool_result for frontend (images, citations, etc.)
             aggregated_tool_result: dict[str, Any] = {
                 "ok": True,
                 "content": exec_result.final_response,
@@ -328,9 +310,7 @@ class ConversationOrchestrator:
                 tool_result=aggregated_tool_result,
             )
 
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # SINGLE-STEP EXECUTION
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # ━━━ SINGLE-STEP EXECUTION ━━━
         is_safe, reason = tool_sandbox.validate_tool_call(
             tool_name=action.tool.value,
             args=action.tool_input.model_dump(exclude_none=True),
@@ -346,14 +326,12 @@ class ConversationOrchestrator:
                 error=f"tool_sandbox_rejected: {reason}",
             )
 
-        # ---- Pure chat ----
         if action.tool == PlannerTool.CHAT:
             reply = await self._generate_chat_reply(
                 msg_list=msg_list,
                 user_message=user_message,
             )
 
-            # Clear intent tracking on chat (no tool was used)
             if user_id in _intent_store:
                 del _intent_store[user_id]
 
@@ -366,7 +344,6 @@ class ConversationOrchestrator:
                 planner_trace=planner_trace,
             )
 
-        # ---- Tool execution ----
         tool_result: dict[str, Any] = {}
         try:
             tool = self.tool_registry.get(action.tool.value)
@@ -384,7 +361,6 @@ class ConversationOrchestrator:
                 "details": {"error": str(exc)},
             })
 
-        # Track intent for follow-up query reconstruction
         _intent_store[user_id] = LastUserIntent(
             tool=action.tool.value,
             intent_type="web" if action.tool == PlannerTool.WEB else action.tool.value,
@@ -392,15 +368,12 @@ class ConversationOrchestrator:
             timestamp=time.time(),
         )
 
-        # Generate reply using tool result as context
         reply = await self._generate_chat_reply(
             msg_list=msg_list,
             user_message=user_message,
             tool_result=tool_result if tool_result.get("ok") else None,
         )
 
-        # Pass tool_result to frontend only if tool succeeded
-        # (frontend uses this for images, citations, etc.)
         passthrough_tool_result = tool_result if tool_result.get("ok") else None
 
         return OrchestratorResult(
@@ -413,9 +386,7 @@ class ConversationOrchestrator:
             tool_result=passthrough_tool_result,
         )
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # LEGACY APIS — kept for backward compatibility
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ━━━ LEGACY APIS ━━━
 
     async def handle(
         self,
@@ -424,7 +395,6 @@ class ConversationOrchestrator:
         message: str,
         conversation_state: dict[str, Any],
     ) -> str:
-        """Legacy API — returns reply string only."""
         class _MinimalConv:
             def __init__(self, cid: int):
                 self.id = cid
@@ -444,7 +414,6 @@ class ConversationOrchestrator:
         message: str,
         conversation_state: dict[str, Any],
     ):
-        """Legacy streaming API — direct model stream, no planner."""
         context_bundle = await context_builder.build(
             db=db,
             conversation_id=conversation_state.get("conversation_id"),
